@@ -107,7 +107,7 @@ def _flash_attn_fwd(
         ...
         score_mod: A callable that takes the attention scores and applies a modification.
         mask_mod: A callable that takes token position information and selectively masks
-        block_sparse_tensors: A tuple of tensors used for block sparsity. 
+        block_sparse_tensors: A tuple of tensors used for block sparsity.
         return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
@@ -346,7 +346,7 @@ def _flash_attn_fwd(
     elif lse is not None:
         lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 1)
     else:
-        lse_tensor = None 
+        lse_tensor = None
 
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
@@ -369,10 +369,10 @@ def _flash_attn_fwd(
             )
 
     if mask_mod is not None:
-        if is_varlen:
-            raise NotImplementedError(
-                "mask_mod with aux_tensors is not yet supported for varlen sequences. This will be fixed in a future PR."
-            )
+        # if is_varlen:
+        #     raise NotImplementedError(
+        #         "mask_mod with aux_tensors is not yet supported for varlen sequences. This will be fixed in a future PR."
+        #     )
         if pack_gqa:
             raise NotImplementedError(
                 "mask_mod with aux_tensors is not yet supported with pack_gqa=True. This will be fixed in a future PR."
@@ -394,7 +394,7 @@ def _flash_attn_fwd(
 
     cute_aux_tensors = None
     if aux_tensors is not None:
-        cute_aux_tensors = [from_dlpack(buf).mark_layout_dynamic() for buf in aux_tensors]
+        cute_aux_tensors = [from_dlpack(buf).mark_layout_dynamic(leading_dim=buf.ndim - 1) for buf in aux_tensors]
 
     compile_key = (
         dtype,
