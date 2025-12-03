@@ -76,6 +76,8 @@ class FlashAttentionForwardSm100:
         qhead_per_kvhead: cutlass.Constexpr[int] = 1,
         is_causal: bool = False,
         is_local: bool = False,
+        is_arbitrary: bool = False,
+        func_num: int = 0,
         is_split_kv: bool = False,
         pack_gqa: bool = False,
         m_block_size: int = 128,
@@ -113,6 +115,8 @@ class FlashAttentionForwardSm100:
         self.is_persistent = is_persistent
         self.is_causal = is_causal
         self.is_local = is_local
+        self.is_arbitrary = is_arbitrary
+        self.func_num = func_num
         self.is_varlen_q = is_varlen_q
         self.use_correction_warps_for_epi = is_varlen_q
         self.qhead_per_kvhead = qhead_per_kvhead
@@ -1620,6 +1624,8 @@ class FlashAttentionForwardSm100:
                 thr_tmem_load=thr_tmem_load,
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
+                mask_arbitrary=self.is_arbitrary,
+                func_num=self.func_num,
                 batch_idx=batch_idx,
                 head_idx=head_idx,
                 aux_tensors=aux_tensors,
@@ -2369,7 +2375,7 @@ class FlashAttentionForwardSm100:
                 self.check_hdim_v_oob,
                 self.qhead_per_kvhead,
             )
-        
+
             # load acc O from smem to rmem for wider vectorization
             tOrO = cute.make_fragment_like(tOsO, self.o_dtype)
             cute.autovec_copy(tOsO, tOrO)

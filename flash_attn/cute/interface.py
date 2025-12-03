@@ -80,6 +80,7 @@ def _flash_attn_fwd(
     page_table: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
+    arbitrary: bool = False,
     softcap: Optional[float] = None,
     window_size_left: Optional[int] = None,
     window_size_right: Optional[int] = None,
@@ -107,7 +108,7 @@ def _flash_attn_fwd(
         ...
         score_mod: A callable that takes the attention scores and applies a modification.
         mask_mod: A callable that takes token position information and selectively masks
-        block_sparse_tensors: A tuple of tensors used for block sparsity. 
+        block_sparse_tensors: A tuple of tensors used for block sparsity.
         return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
@@ -288,6 +289,7 @@ def _flash_attn_fwd(
 
     use_block_sparsity = sparse_tensors is not None
 
+    func_num = 0
     if mask_mod is None:
         if causal:
             window_size_right = 0
@@ -297,8 +299,17 @@ def _flash_attn_fwd(
                 causal, local = True, False
             else:
                 causal, local = False, True
+        if arbitrary:
+            window_size_left, window_size_right = 0, 0
+            causal, local = False, False
     else:
-        causal, local = False, False
+        causal, local, arbitrary = False, False, False
+    if arbitrary:
+        if aux_tensors is None:
+            raise ValueError("aux_tensors must be provided for arbitrary mask")
+        if aux_tensors[0].shape[2] % 2 == 0:
+            raise ValueError("aux_tensors must have an odd number of functions for arbitrary mask")
+        func_num = aux_tensors[0].shape[2]
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -346,7 +357,7 @@ def _flash_attn_fwd(
     elif lse is not None:
         lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 1)
     else:
-        lse_tensor = None 
+        lse_tensor = None
 
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
@@ -369,10 +380,10 @@ def _flash_attn_fwd(
             )
 
     if mask_mod is not None:
-        if is_varlen:
-            raise NotImplementedError(
-                "mask_mod with aux_tensors is not yet supported for varlen sequences. This will be fixed in a future PR."
-            )
+        # if is_varlen:
+        #     raise NotImplementedError(
+        #         "mask_mod with aux_tensors is not yet supported for varlen sequences. This will be fixed in a future PR."
+        #     )
         if pack_gqa:
             raise NotImplementedError(
                 "mask_mod with aux_tensors is not yet supported with pack_gqa=True. This will be fixed in a future PR."
@@ -394,7 +405,7 @@ def _flash_attn_fwd(
 
     cute_aux_tensors = None
     if aux_tensors is not None:
-        cute_aux_tensors = [from_dlpack(buf).mark_layout_dynamic() for buf in aux_tensors]
+        cute_aux_tensors = [from_dlpack(buf).mark_layout_dynamic(leading_dim=buf.ndim - 1) for buf in aux_tensors]
 
     compile_key = (
         dtype,
@@ -402,6 +413,8 @@ def _flash_attn_fwd(
         head_dim_v,
         qhead_per_kvhead,
         causal,
+        arbitrary,
+        func_num,
         score_mod_hash,
         mask_mod_hash,
         use_block_sparsity,
@@ -435,6 +448,8 @@ def _flash_attn_fwd(
                 qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
+                is_arbitrary=arbitrary,
+                func_num=func_num,
                 pack_gqa=pack_gqa,
                 tile_m=m_block_size,
                 tile_n=n_block_size,
@@ -455,6 +470,8 @@ def _flash_attn_fwd(
                 qhead_per_kvhead=qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
+                is_arbitrary=arbitrary,
+                func_num=func_num,
                 is_split_kv=is_split_kv,
                 pack_gqa=pack_gqa,
                 m_block_size=m_block_size,
