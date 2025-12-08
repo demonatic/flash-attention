@@ -477,9 +477,9 @@ class AttentionMask:
                         value_valid = True
                 cond = cutlass.Boolean(value_valid)
                 acc_S[i] = acc_S[i] if cond else -Float32.inf
-                if const_expr(mask_seqlen):
-                    out_of_bounds = (global_row >= self.seqlen_q) or (global_col >= self.seqlen_k)
-                    acc_S[i] = -Float32.inf if out_of_bounds else acc_S[i]
+                # if const_expr(mask_seqlen):  # for arbitrary mask, we do not need this to check boundary, casuse the boundary information is in func and for fwd, we do not write the output that exceeds the seqlen_q
+                #     out_of_bounds = (global_row >= self.seqlen_q) or (global_col >= self.seqlen_k)
+                #     acc_S[i] = -Float32.inf if out_of_bounds else acc_S[i]
 
         else:  # Causal or local
             causal_row_offset = 1 + self.seqlen_k - n_block * self.tile_n - self.seqlen_q

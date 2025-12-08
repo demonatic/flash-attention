@@ -558,7 +558,7 @@ class FlashAttentionForwardSm100:
         if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
             TileScheduler = SingleTileVarlenScheduler
         else:
-            if const_expr(self.is_causal or self.is_local):
+            if const_expr(self.is_causal or self.is_local or self.is_arbitrary):
                 TileScheduler = SingleTileLPTScheduler
             else:
                 TileScheduler = (
