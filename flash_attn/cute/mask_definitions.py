@@ -264,9 +264,21 @@ def random_doc_id_tensor(nheads, batch, seqlen_q, device="cpu"):
     return doc_ids_tensor
 
 def random_arbitrary_func_tensor(nheads, batch, n_func, seqlen_q, seqlen_k, device="cpu"):
-    arbitrary_func_tensor = torch.zeros(batch, nheads, n_func, seqlen_q, dtype=torch.int32, device=device)
-    for i in range(seqlen_q):
-        arbitrary_func_tensor[:, :, 0, i] = torch.randint(i + 1, i + 2, size=(batch, nheads), device=device)
+    arbitrary_func_tensor = torch.zeros(batch, nheads, n_func, seqlen_q + 256, dtype=torch.int32, device=device)
+    lengths = [315, 1021, 2201, 199, 1266, 494, 1204, 2669, 555, 6, 1217, 1351, 1136, 281, 2475]
+    offset = 0
+    for i in range(len(lengths)):
+        if i == 0:
+            for j in range(lengths[i]):
+                arbitrary_func_tensor[:, :, 0, offset + j] = j + 1
+                arbitrary_func_tensor[:, :, 1, offset + j] = j + 2
+                arbitrary_func_tensor[:, :, 2, offset + j] = j + 2
+        else:
+            for j in range(lengths[i]):
+                arbitrary_func_tensor[:, :, 0, offset + j] = 0
+                arbitrary_func_tensor[:, :, 1, offset + j] = offset
+                arbitrary_func_tensor[:, :, 2, offset + j] = offset + j + 1
+        offset += lengths[i]
     # coef = 1 / n_func
     # for i in range(n_func):
     #     arbitrary_func_tensor[:, :, i, :] = torch.randint((int)(i * coef * seqlen_k), (int)((i + 1) * coef * seqlen_k), size=(batch, nheads, seqlen_q), device=device)

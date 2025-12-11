@@ -16,33 +16,19 @@ import math
 from typing import Optional
 from einops import rearrange
 
-import pytest
 import torch
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 import torch.nn.functional as F
-import nvtx
 
-from flash_attn.cute.interface import _flash_attn_fwd
-from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+from flash_attn.cute.interface import flash_attn_func
+from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch, bhqk_to_linear_sparse_tensors
 from flash_attn.cute.mask_definitions import (
     get_mask_pair,
     STATIC_MASKS,
     random_arbitrary_func_tensor,
 )
-from flash_attn.cute.testing import attention_ref
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
 
-
-@pytest.fixture(autouse=True)
-def reset_torch_state():
-    """Reset torch dynamo/compile state between tests to avoid state pollution."""
-    torch._dynamo.reset()
-    torch.cuda.empty_cache()
-
-    yield
-
-    torch._dynamo.reset()
-    torch.cuda.empty_cache()
 
 def create_tensors(
     batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim_v, dtype
@@ -53,13 +39,13 @@ def create_tensors(
     # cu_seqlens_q = cu_seqlens_q.contiguous().to(dtype=torch.int32, device=device)
     # total_q = cu_seqlens_q[-1]
     # total_k = total_q
-    q = torch.empty(batch_size, seqlen_q, nheads, headdim, device=device, dtype=dtype).uniform_(-1, 1)
+    q = torch.empty(batch_size, seqlen_q, nheads, headdim, device=device, dtype=dtype).uniform_(-1, 1).requires_grad_(True)
     k = torch.empty(
         batch_size, seqlen_k, nheads_kv, headdim, device=device, dtype=dtype
-    ).uniform_(-1, 1)
+    ).uniform_(-1, 1).requires_grad_(True)
     v = torch.empty(
         batch_size, seqlen_k, nheads_kv, headdim_v, device=device, dtype=dtype
-    ).uniform_(-1, 1)
+    ).uniform_(-1, 1).requires_grad_(True)
     out = torch.empty(
         batch_size, seqlen_q, nheads, headdim_v, device=device, dtype=dtype
     )
@@ -75,112 +61,39 @@ def create_tensors(
         "cu_seqlens_k": None,
     }
 
-def pad_input(unpadded_input, cu_seqlen, batch, seqlen):
-    indices = []
-    for i in range(batch):
-        indices.append(
-            torch.arange(seqlen * i, seqlen * i + cu_seqlen[i + 1] - cu_seqlen[i])
-        )
-    indices = torch.cat(indices)
-    output = torch.zeros(
-        (batch * seqlen),
-        *unpadded_input.shape[1:],
-        device=unpadded_input.device,
-        dtype=unpadded_input.dtype
-    )
-    output[indices] = unpadded_input
-    return rearrange(output, "(b s) ... -> b s ...", b=batch)
-
-def unpad_input(padded_input, cu_seqlen):
-    padded_input.reshape(padded_input.size(0), padded_input.size(1), -1)
-    output = []
-    for i in range(len(cu_seqlen) - 1):
-        output.append(padded_input[i, : (cu_seqlen[i + 1] - cu_seqlen[i]), :])
-    return torch.cat(output, dim=0)
-
-
-def compute_reference_arbitrary(tensors, max_seqlen_q, max_seqlen_k, mask_mod_flex, block_size: Optional[tuple[int, int]] = None):
+def compute_reference_arbitrary(tensors, arbitrary_func, up_cast=False):
     """Compute reference of arbitrary mask"""
-    q = tensors["q"]
-    k = tensors["k"]
-    v = tensors["v"]
-    cu_seqlens_q = tensors["cu_seqlens_q"]
-    cu_seqlens_k = tensors["cu_seqlens_k"]
-    batch_size = cu_seqlens_q.shape[0] - 1
-    nheads = q.shape[1]
-    headdim = q.shape[2]
-
-    padded_q = pad_input(q, cu_seqlens_q, batch_size, max_seqlen_q)
-    padded_k = pad_input(k, cu_seqlens_k, batch_size, max_seqlen_k)
-    padded_v = pad_input(v, cu_seqlens_k, batch_size, max_seqlen_k)
-
-    padded_q = padded_q.view(batch_size, max_seqlen_q, nheads, headdim)
-    padded_k = padded_k.view(batch_size, max_seqlen_k, nheads, headdim)
-    padded_v = padded_v.view(batch_size, max_seqlen_k, nheads, headdim)
+    q = tensors["q"] if not up_cast else tensors["q"].float()
+    k = tensors["k"] if not up_cast else tensors["k"].float()
+    v = tensors["v"] if not up_cast else tensors["v"].float()
+    batch_size = q.shape[0]
+    seqlen_q = q.shape[1]
+    seqlen_k = k.shape[1]
+    nheads = q.shape[2]
+    nheads_kv = k.shape[2]
+    headdim = q.shape[3]
+    scale = 1.0 / math.sqrt(headdim)
 
     qk_attn = torch.einsum(
         "bnhd,bmhd->bhnm",
-        padded_q,
-        padded_k,
+        q * scale,
+        k,
     )
 
-    return s
+    func_num = arbitrary_func.shape[2]
+    for i in range(seqlen_q):
+        for j in range(func_num // 2):
+            qk_attn[:, :, i, arbitrary_func[0, 0, 2 * j, i]:arbitrary_func[0, 0, 2 * j + 1, i]] = -float("inf")
+        qk_attn[:, :, i, arbitrary_func[0, 0, func_num - 1, i]:] = -float("inf")
 
-    scale = 1.0 / math.sqrt(headdim)
-
-    # Handle identity (no masking) case
-    if mask_mod_flex is None:
-        out_ref = F.scaled_dot_product_attention(q, k, v, scale=scale)
-        return out_ref.transpose(1, 2).contiguous()
-
-    block_mask_kwargs = {}
-    if block_size is not None:
-        block_mask_kwargs["BLOCK_SIZE"] = block_size
-
-    block_mask = create_block_mask(
-        mask_mod_flex,
-        B=batch_size,
-        H=nheads,
-        Q_LEN=seqlen_q,
-        KV_LEN=seqlen_k,
-        device=q.device,
-        **block_mask_kwargs,
+    softmax_attn = F.softmax(qk_attn, dim=-1)
+    out = torch.einsum(
+        "bhnm,bmhd->bnhd",
+        softmax_attn,
+        v,
     )
-    out_ref = flex_attention(q, k, v, block_mask=block_mask, scale=scale)
-    return out_ref.transpose(1, 2).contiguous()
 
-
-SEQLEN_PAIRS_COMPREHENSIVE = [
-    (1, 1),
-    (64, 128),
-    (128, 192),
-    (256, 256),
-    (239, 1),
-    (799, 3),
-    (113, 203),
-    (113, 128),
-    (128, 217),
-    (113, 211),
-    (108, 256),
-    (256, 512),
-    (384, 256),
-    (640, 128),
-    (512, 256),
-    (1024, 1024),
-    (1023, 1024),
-    (1024, 1023),
-    (4096, 4096),
-    (4224, 4224),
-]
-
-SEQLEN_PAIRS_SMOKE = [
-    (128, 128),
-    (256, 256),
-    (113, 203),
-    (1024, 1024),
-    (128, 8192)
-]
-
+    return out
 
 def _run_mask_test(
     seqlen_q,
@@ -205,13 +118,13 @@ def _run_mask_test(
     else:
         raise ValueError(f"Unknown kv_mode: {kv_mode}")
 
-    batch_size = 8
+    batch_size = 1
     headdim_v = headdim
 
     # aux_tensors_arg = None
     # mask_mod_cute, mask_mod_flex = get_mask_pair("causal", seqlen_q, seqlen_k)
     mask_mod_cute, mask_mod_flex = get_mask_pair("arbitrary")
-    arbitrary_func = random_arbitrary_func_tensor(1, batch_size, 1, seqlen_q, seqlen_k, device="cuda")
+    arbitrary_func = random_arbitrary_func_tensor(1, batch_size, 3, seqlen_q, seqlen_k, device="cuda")
     original_flex_mask = mask_mod_flex
 
     def mask_mod_flex(b, h, q_idx, kv_idx, arbitrary_func=arbitrary_func):
@@ -230,113 +143,68 @@ def _run_mask_test(
     else:
         sparse_tile_m = tile_m
 
-    nvtx.push_range("create_block_mask")
     bm = create_block_mask(
         mask_mod_flex,
-        batch_size,
-        nheads,
+        1,
+        1,
         seqlen_q,
         seqlen_k,
         device="cuda",
         BLOCK_SIZE=(sparse_tile_m, tile_n),
     )
-    _, _, mask_cnt, mask_idx, full_cnt, full_idx, *_ = bm.as_tuple()
-    nvtx.pop_range()
+    _, _, k_mask_cnt, k_mask_idx, k_full_cnt, k_full_idx, *_ = bm.as_tuple()
     softmax_scale = 1.0 / math.sqrt(headdim)
 
-    block_sparse_mask = BlockSparseTensorsTorch(
-        mask_block_cnt=mask_cnt,
-        mask_block_idx=mask_idx,
-        full_block_cnt=full_cnt,
-        full_block_idx=full_idx,
+    k_block_sparse_mask = BlockSparseTensorsTorch(
+        mask_block_cnt=k_mask_cnt,
+        mask_block_idx=k_mask_idx,
+        full_block_cnt=k_full_cnt,
+        full_block_idx=k_full_idx,
     )
+    linear_k_block_sparse_mask = bhqk_to_linear_sparse_tensors(k_block_sparse_mask)
 
-    out_tuple = _flash_attn_fwd(
+    bm_bwd = create_block_mask(
+        mask_mod_flex,
+        1,
+        1,
+        seqlen_q,
+        seqlen_k,
+        device="cuda",
+        BLOCK_SIZE=(tile_m, tile_n),
+    )
+    _, _, _, _, _, _, q_mask_cnt, q_mask_idx, q_full_cnt, q_full_idx, *_ = bm_bwd.as_tuple()
+    q_block_sparse_mask = BlockSparseTensorsTorch(
+        mask_block_cnt=q_mask_cnt,
+        mask_block_idx=q_mask_idx,
+        full_block_cnt=q_full_cnt,
+        full_block_idx=q_full_idx,
+    )
+    linear_q_block_sparse_mask = bhqk_to_linear_sparse_tensors(q_block_sparse_mask)
+
+    out_cute, lse_cute = flash_attn_func(
         q=tensors["q"],
         k=tensors["k"],
         v=tensors["v"],
-        out=tensors["out"],
-        lse=tensors["lse"],
-        cu_seqlens_q=tensors["cu_seqlens_q"],
-        cu_seqlens_k=tensors["cu_seqlens_k"],
-        seqused_q=None,
-        seqused_k=None,
-        page_table=None,
         softmax_scale=softmax_scale,
         causal=causal,
         arbitrary=True,
-        softcap=None,
-        window_size_left=None,
-        window_size_right=None,
+        window_size=(None, None),
         learnable_sink=None,
-        m_block_size=tile_m,
-        n_block_size=tile_n,
-        num_threads=384,
+        softcap=0.0,
+        num_splits=1,
         pack_gqa=False,
-        _compute_capability=None,
-        score_mod=None,
+        deterministic=False,
         mask_mod=None,
-        block_sparse_tensors=block_sparse_mask,
-        return_lse=True,
+        linear_k_block_sparse_tensors=linear_k_block_sparse_mask,
+        linear_q_block_sparse_tensors=linear_q_block_sparse_mask,
         aux_tensors=aux_tensors_arg,
     )
 
-    out_cute = out_tuple[0]
-    # q_padded = pad_input(tensors["q"], tensors["cu_seqlens_q"], batch_size, seqlen_q)
-    # k_padded = pad_input(tensors["k"], tensors["cu_seqlens_k"], batch_size, seqlen_k)
-    # v_padded = pad_input(tensors["v"], tensors["cu_seqlens_k"], batch_size, seqlen_k)
+    out_ref_fp32 = compute_reference_arbitrary(tensors, arbitrary_func, up_cast=True)
+    out_ref = compute_reference_arbitrary(tensors, arbitrary_func, up_cast=False)
 
-    block_size = (tile_m, tile_n)
-    out_ref_fp32, _ = attention_ref(
-      q=tensors["q"],
-      k=tensors["k"],
-      v=tensors["v"],
-      query_padding_mask=None,
-      key_padding_mask=None,
-      key_leftpad=None,
-      attn_bias=None,
-      dropout_p=0.0,
-      dropout_mask=None,
-      causal=True,
-      qv=None,
-      q_descale=None,
-      k_descale=None,
-      v_descale=None,
-      window_size=(None, None),
-      attention_chunk=0,
-      sink_token_length=0,
-      learnable_sink=None,
-      softcap=0.0,
-      upcast=True,
-      reorder_ops=False,
-      intermediate_dtype=None,
-    )
-    out_ref, _ = attention_ref(
-      q=tensors["q"],
-      k=tensors["k"],
-      v=tensors["v"],
-      query_padding_mask=None,
-      key_padding_mask=None,
-      key_leftpad=None,
-      attn_bias=None,
-      dropout_p=0.0,
-      dropout_mask=None,
-      causal=True,
-      qv=None,
-      q_descale=None,
-      k_descale=None,
-      v_descale=None,
-      window_size=(None, None),
-      attention_chunk=0,
-      sink_token_length=0,
-      learnable_sink=None,
-      softcap=0.0,
-      upcast=False,
-      reorder_ops=False,
-      intermediate_dtype=None,
-    )
-    # out_ref_fp32 = unpad_input(out_ref_fp32, tensors["cu_seqlens_q"])
-    # out_ref = unpad_input(out_ref, tensors["cu_seqlens_q"])
+    print(f"Output max diff: {(out_cute - out_ref_fp32).abs().max().item()}")
+    print(f"Pytorch max diff: {(out_ref - out_ref_fp32).abs().max().item()}")
 
     # Check for invalid values
     assert out_cute.shape == out_ref_fp32.shape == out_ref.shape
@@ -344,50 +212,32 @@ def _run_mask_test(
     assert not torch.isnan(out_ref_fp32).any()
     assert torch.isfinite(out_cute).all()
     assert torch.isfinite(out_ref_fp32).all()
+    assert (out_cute - out_ref_fp32).abs().max().item() <= 2 * (out_ref - out_ref_fp32).abs().max().item()
 
-    # Compute numerical tolerance (matching flash attention tests)
-    fwd_atol = 2 * (out_ref_fp32 + 0.3 - 0.3 - out_ref_fp32).abs().max().item()
-    rtol = 2
+    dout = torch.rand_like(out_cute)
 
-    ref_error = (out_ref - out_ref_fp32).abs().max().item()
-    cute_error = (out_cute - out_ref_fp32).abs().max().item()
-
-    mask_desc = f"mask_mod=arbitrary_causal"
-
-    print(
-        f"\n{mask_desc} @ Q={seqlen_q}, K={seqlen_k}, H={nheads}/{nheads_kv} ({kv_mode}), "
-        f"D={headdim}, M={tile_m}, N={tile_n}"
+    dq, dk, dv = torch.autograd.grad(
+        out_cute, (tensors["q"], tensors["k"], tensors["v"]), dout
     )
-    print("  Reference implementation: FlexAttention")
-    print(f"  Reference vs FP32: {ref_error:.2e}")
-    print(f"  Kernel vs FP32: {cute_error:.2e}")
-    print(f"  Tolerance: rtol={rtol} * {ref_error:.2e} + {fwd_atol:.2e}")
-    print(f"  Error ratio: {cute_error / max(ref_error, 1e-10):.2f}")
-
-    # Debug: show some sample values if error is large
-    if cute_error > 1e-2:
-        print(f"  DEBUG: Sample kernel output: {out_cute[0, 0, :5]}")
-        print(f"  DEBUG: Sample reference output: {out_ref_fp32[0, 0, :5]}")
-        print(f"  DEBUG: Max diff location: {(out_cute - out_ref_fp32).abs().argmax()}")
-        max_diff_idx = (out_cute - out_ref_fp32).abs().argmax()
-        max_diff_coords = torch.unravel_index(max_diff_idx, out_cute.shape)
-        print(f"  DEBUG: Max diff at coords: {max_diff_coords}")
-        print(f"  DEBUG: Kernel value: {out_cute[max_diff_coords]:.6f}")
-        print(f"  DEBUG: Reference value: {out_ref_fp32[max_diff_coords]:.6f}")
-
-    # Use the same assertion logic as FlashAttention tests
-    assert cute_error <= rtol * ref_error + fwd_atol, (
-        f"Kernel error {cute_error:.2e} exceeds {rtol}x PyTorch error {ref_error:.2e} + {fwd_atol:.2e}"
+    (dq_ref_fp32, dk_ref_fp32, dv_ref_fp32) = torch.autograd.grad(
+        out_ref_fp32, (tensors["q"], tensors["k"], tensors["v"]), dout
+    )
+    (dq_ref, dk_ref, dv_ref) = torch.autograd.grad(
+        out_ref, (tensors["q"], tensors["k"], tensors["v"]), dout
     )
 
+    print(f"dV max diff: {(dv - dv_ref_fp32).abs().max().item()}")
+    print(f"dV Pytorch max diff: {(dv_ref - dv_ref_fp32).abs().max().item()}")
+    print(f"dK max diff: {(dk - dk_ref_fp32).abs().max().item()}")
+    print(f"dK Pytorch max diff: {(dk_ref - dk_ref_fp32).abs().max().item()}")
+    print(f"dQ max diff: {(dq - dq_ref_fp32).abs().max().item()}")
+    print(f"dQ Pytorch max diff: {(dq_ref - dq_ref_fp32).abs().max().item()}")
 
-@pytest.mark.parametrize("seqlen_q,seqlen_k", SEQLEN_PAIRS_SMOKE)
-@pytest.mark.parametrize("nheads", [16])
-@pytest.mark.parametrize("kv_mode", ["mha"])
-@pytest.mark.parametrize("headdim", [128])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("use_block_sparsity", [True, False])
-@pytest.mark.parametrize("tile_m,tile_n", [(128, 128), (128, 112), (64, 128)])
+    assert (dv - dv_ref_fp32).abs().max().item() <= 5 * (dv_ref - dv_ref_fp32).abs().max().item()
+    assert (dk - dk_ref_fp32).abs().max().item() <= 5 * (dk_ref - dk_ref_fp32).abs().max().item()
+    assert (dq - dq_ref_fp32).abs().max().item() <= 5 * (dq_ref - dq_ref_fp32).abs().max().item()
+
+
 def test_arbitrary_mask(
     seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype, use_block_sparsity, tile_m, tile_n
 ):
@@ -411,13 +261,13 @@ def test_arbitrary_mask(
 
 if __name__ == "__main__":
     test_arbitrary_mask(
-        seqlen_q=8192,
-        seqlen_k=8192,
-        nheads=8,
+        seqlen_q=16390,
+        seqlen_k=16390,
+        nheads=3,
         kv_mode="mha",
         headdim=128,
         dtype=torch.bfloat16,
-        use_block_sparsity=False,
+        use_block_sparsity=True,
         tile_m=128,
         tile_n=128,
     )

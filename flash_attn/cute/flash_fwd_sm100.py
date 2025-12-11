@@ -35,7 +35,7 @@ from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
-from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn.cute.block_sparsity import LinearBlockSparseTensors
 from flash_attn.cute.block_sparse_utils import (
     get_total_block_count,
     produce_block_sparse_loads_sm100,
@@ -264,7 +264,7 @@ class FlashAttentionForwardSm100:
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
-        blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        blocksparse_tensors: Optional[LinearBlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
@@ -737,7 +737,7 @@ class FlashAttentionForwardSm100:
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         learnable_sink: Optional[cute.Tensor],
-        blocksparse_tensors: Optional[BlockSparseTensors],
+        blocksparse_tensors: Optional[LinearBlockSparseTensors],
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         tP_layout: cute.ComposedLayout,
@@ -1129,7 +1129,7 @@ class FlashAttentionForwardSm100:
         num_splits: Int32,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
-        blocksparse_tensors: Optional[BlockSparseTensors],
+        blocksparse_tensors: Optional[LinearBlockSparseTensors],
     ):
         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
         tidx = cute.arch.thread_idx()[0] % num_load_threads
@@ -1316,7 +1316,7 @@ class FlashAttentionForwardSm100:
         num_splits: Int32,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
-        blocksparse_tensors: Optional[BlockSparseTensors],
+        blocksparse_tensors: Optional[LinearBlockSparseTensors],
     ):
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
@@ -1549,7 +1549,7 @@ class FlashAttentionForwardSm100:
         TileSchedulerCls: Callable,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
-        blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        blocksparse_tensors: Optional[LinearBlockSparseTensors] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -1963,7 +1963,7 @@ class FlashAttentionForwardSm100:
         num_splits: Int32,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
-        blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        blocksparse_tensors: Optional[LinearBlockSparseTensors] = None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
