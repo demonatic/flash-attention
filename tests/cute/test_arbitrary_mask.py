@@ -26,6 +26,7 @@ from flash_attn.cute.mask_definitions import (
     get_mask_pair,
     STATIC_MASKS,
     random_arbitrary_func_tensor,
+    flex_arbitrary_mask,
 )
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
 
@@ -123,8 +124,10 @@ def _run_mask_test(
 
     # aux_tensors_arg = None
     # mask_mod_cute, mask_mod_flex = get_mask_pair("causal", seqlen_q, seqlen_k)
-    mask_mod_cute, mask_mod_flex = get_mask_pair("arbitrary")
+    # mask_mod_cute, mask_mod_flex = get_mask_pair("arbitrary")
+    mask_mod_flex = flex_arbitrary_mask
     arbitrary_func = random_arbitrary_func_tensor(1, batch_size, 3, seqlen_q, seqlen_k, device="cuda")
+    print(f"{arbitrary_func=} | {arbitrary_func.shape=} | {arbitrary_func.stride()=}\n")
     original_flex_mask = mask_mod_flex
 
     def mask_mod_flex(b, h, q_idx, kv_idx, arbitrary_func=arbitrary_func):
@@ -180,6 +183,8 @@ def _run_mask_test(
         full_block_idx=q_full_idx,
     )
     linear_q_block_sparse_mask = bhqk_to_linear_sparse_tensors(q_block_sparse_mask)
+    
+    print(f'{tensors["q"].shape=} | {tensors["k"].shape=} | {tensors["v"].shape=}\n')
 
     out_cute, lse_cute = flash_attn_func(
         q=tensors["q"],
@@ -199,6 +204,8 @@ def _run_mask_test(
         linear_q_block_sparse_tensors=linear_q_block_sparse_mask,
         aux_tensors=aux_tensors_arg,
     )
+    
+    print(f"{out_cute.shape=} | {lse_cute.shape=}\n")
 
     out_ref_fp32 = compute_reference_arbitrary(tensors, arbitrary_func, up_cast=True)
     out_ref = compute_reference_arbitrary(tensors, arbitrary_func, up_cast=False)
@@ -219,6 +226,9 @@ def _run_mask_test(
     dq, dk, dv = torch.autograd.grad(
         out_cute, (tensors["q"], tensors["k"], tensors["v"]), dout
     )
+    
+    print(f"{dq.shape=} | {dk.shape=} | {dv.shape=}\n")
+    
     (dq_ref_fp32, dk_ref_fp32, dv_ref_fp32) = torch.autograd.grad(
         out_ref_fp32, (tensors["q"], tensors["k"], tensors["v"]), dout
     )
