@@ -20,6 +20,8 @@ import torch
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 import torch.nn.functional as F
 
+import magi_to_hstu_cuda
+
 from flash_attn.cute.interface import flash_attn_func
 from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch, bhqk_to_linear_sparse_tensors
 from flash_attn.cute.mask_definitions import (
@@ -29,6 +31,33 @@ from flash_attn.cute.mask_definitions import (
     flex_arbitrary_mask,
 )
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
+
+
+def pad_at_dim(
+    x: torch.Tensor,
+    dim: int,
+    pad_size: int,
+    value: float = 0.0,
+    side: str = "right",
+) -> torch.Tensor:
+    """
+    Pads a tensor along a specified dimension with a given value, either on the left or right side.
+
+    Args:
+        x (torch.Tensor): Input tensor to be padded.
+        dim (int): The dimension along which to apply padding.
+        pad_size (int): The number of values to pad.
+        value (float, optional): The padding value. Defaults to ``0.0``.
+        side (str, optional): Side on which to apply the padding, either ``left`` or ``right``.
+            Defaults to ``right``.
+
+    Returns:
+        torch.Tensor: The padded tensor with the same number of dimensions as the input.
+    """
+    pad = [0] * (2 * x.dim())
+    pad_idx = -(dim + 1) * 2 + (0 if side == "left" else 1)
+    pad[pad_idx] = pad_size
+    return F.pad(x, pad=tuple(pad), mode="constant", value=value)
 
 
 def create_tensors(
@@ -122,11 +151,26 @@ def _run_mask_test(
     batch_size = 1
     headdim_v = headdim
 
-    # aux_tensors_arg = None
     # mask_mod_cute, mask_mod_flex = get_mask_pair("causal", seqlen_q, seqlen_k)
     # mask_mod_cute, mask_mod_flex = get_mask_pair("arbitrary")
     mask_mod_flex = flex_arbitrary_mask
-    arbitrary_func = random_arbitrary_func_tensor(1, batch_size, 3, seqlen_q, seqlen_k, device="cuda")
+    
+    # arbitrary_func = random_arbitrary_func_tensor(1, batch_size, 3, seqlen_q, seqlen_k, device="cuda")
+    q_ranges = torch.tensor([[0, seqlen_q]], dtype=torch.int32, device="cuda")
+    k_ranges = torch.tensor([[0, seqlen_k]], dtype=torch.int32, device="cuda")
+    attn_type_map = torch.tensor([0], dtype=torch.int32, device="cuda")
+    
+    arbitrary_func: torch.Tensor = magi_to_hstu_cuda.magi_to_hstu(
+        q_ranges=q_ranges,
+        k_ranges=k_ranges,
+        mask_types=attn_type_map,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        n_max_func=3, # NOTE: this must be an odd number
+    ).unsqueeze(0).unsqueeze(0)
+    arbitrary_func = pad_at_dim(arbitrary_func, dim=-1, pad_size=tile_m * 2, value=0)
+    arbitrary_func.masked_fill_(arbitrary_func == -1, seqlen_q)
+    
     print(f"{arbitrary_func=} | {arbitrary_func.shape=} | {arbitrary_func.stride()=}\n")
     original_flex_mask = mask_mod_flex
 
@@ -271,9 +315,9 @@ def test_arbitrary_mask(
 
 if __name__ == "__main__":
     test_arbitrary_mask(
-        seqlen_q=16390,
-        seqlen_k=16390,
-        nheads=3,
+        seqlen_q=14 * 1024,
+        seqlen_k=14 * 1024,
+        nheads=1,
         kv_mode="mha",
         headdim=128,
         dtype=torch.bfloat16,
