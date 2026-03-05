@@ -392,7 +392,6 @@ def _flash_attn_fwd(
         page_size not in [None, 128],  # paged KV non-TMA
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
-        import torch
         print(f"rank {torch.distributed.get_rank()} Compiling flash_attn_fwd with compile_key: {compile_key}")
         # Only create from_dlpack tensors when compilation is needed
         q_tensor, k_tensor, v_tensor, o_tensor = [
