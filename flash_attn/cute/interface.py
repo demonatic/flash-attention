@@ -395,13 +395,13 @@ def _flash_attn_fwd(
         print(f"rank {torch.distributed.get_rank()} Compiling flash_attn_fwd with compile_key: {compile_key}")
         # Only create from_dlpack tensors when compilation is needed
         q_tensor, k_tensor, v_tensor, o_tensor = [
-            from_dlpack(t.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=t.ndim - 1)
+            utils.convert_from_dlpack(t.detach(), leading_dim=t.ndim - 1, alignment=16)
             for t in (q, k, v, out if not is_split_kv else out_partial)
         ]
         if is_split_kv:
-            lse_tensor = from_dlpack(lse_partial.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=lse_partial.ndim - 1)
+            lse_tensor = utils.convert_from_dlpack(lse_partial.detach(), leading_dim=lse_partial.ndim - 1, alignment=4)
         elif lse is not None:
-            lse_tensor = from_dlpack(lse.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=lse.ndim - 1)
+            lse_tensor = utils.convert_from_dlpack(lse.detach(), leading_dim=lse.ndim - 1, alignment=4)
         else:
             lse_tensor = None
         (
@@ -411,13 +411,13 @@ def _flash_attn_fwd(
             seqused_k_tensor,
             learnable_sink_tensor,
         ) = [
-            from_dlpack(t.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=0)
+            utils.convert_from_dlpack(t.detach(), leading_dim=0, alignment=4)
             if t is not None
             else None
             for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
         ]
         page_table_tensor = (
-            from_dlpack(page_table.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=1)
+            utils.convert_from_dlpack(page_table.detach(), leading_dim=1, alignment=4)
             if page_table is not None
             else None
         )
@@ -439,7 +439,7 @@ def _flash_attn_fwd(
 
         cute_aux_tensors = None
         if aux_tensors is not None:
-            cute_aux_tensors = [from_dlpack(buf, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=buf.ndim - 1) for buf in aux_tensors]
+            cute_aux_tensors = [utils.convert_from_dlpack(buf, leading_dim=buf.ndim - 1) for buf in aux_tensors]
         
         if compute_capability == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
@@ -789,14 +789,14 @@ def _flash_attn_bwd(
     compile_key_pre = (compute_capability, dtype, head_dim_v, m_block_size, num_threads)
     if compile_key_pre not in _flash_attn_bwd.compile_cache_pre:
         # Only create from_dlpack tensors when compilation is needed
-        o_tensor = from_dlpack(out.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=out.ndim - 1)
-        do_tensor = from_dlpack(dout.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dout.ndim - 1)
-        dpsum_tensor = from_dlpack(dpsum.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dpsum.ndim - 1)
-        lse_tensor = from_dlpack(lse.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=lse.ndim - 1)
-        lse_log2_tensor = from_dlpack(lse_log2.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=lse_log2.ndim - 1)
-        dq_accum_tensor = from_dlpack(dq_accum.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dq_accum.ndim - 1)
-        cu_seqlens_q_tensor = from_dlpack(cu_seqlens_q.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=cu_seqlens_q.ndim - 1) if cu_seqlens_q is not None else None
-        seqused_q_tensor = from_dlpack(seqused_q.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=seqused_q.ndim - 1) if seqused_q is not None else None
+        o_tensor = utils.convert_from_dlpack(out.detach(), leading_dim=out.ndim - 1, alignment=16)
+        do_tensor = utils.convert_from_dlpack(dout.detach(), leading_dim=dout.ndim - 1, alignment=16)
+        dpsum_tensor = utils.convert_from_dlpack(dpsum.detach(), leading_dim=dpsum.ndim - 1, alignment=16)
+        lse_tensor = utils.convert_from_dlpack(lse.detach(), leading_dim=lse.ndim - 1, alignment=4)
+        lse_log2_tensor = utils.convert_from_dlpack(lse_log2.detach(), leading_dim=lse_log2.ndim - 1, alignment=16)
+        dq_accum_tensor = utils.convert_from_dlpack(dq_accum.detach(), leading_dim=dq_accum.ndim - 1, alignment=16)
+        cu_seqlens_q_tensor = utils.convert_from_dlpack(cu_seqlens_q.detach(), leading_dim=cu_seqlens_q.ndim - 1, alignment=4) if cu_seqlens_q is not None else None
+        seqused_q_tensor = utils.convert_from_dlpack(seqused_q.detach(), leading_dim=seqused_q.ndim - 1, alignment=4) if seqused_q is not None else None
         
         fa_bwd_pre = FlashAttentionBackwardPreprocess(
             dtype,
@@ -881,17 +881,17 @@ def _flash_attn_bwd(
     if compile_key not in _flash_attn_bwd.compile_cache:
         # Only create from_dlpack tensors when compilation is needed
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
-            from_dlpack(t.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=t.ndim - 1)
+            utils.convert_from_dlpack(t.detach(), leading_dim=t.ndim - 1, alignment=16)
             for t in (q, k, v, dout, dq, dk, dv)
         ]
-        lse_log2_tensor = from_dlpack(lse_log2.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=lse_log2.ndim - 1)
-        dpsum_tensor = from_dlpack(dpsum.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dpsum.ndim - 1)
-        dq_accum_tensor = from_dlpack(dq_accum.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dq_accum.ndim - 1)
+        lse_log2_tensor = utils.convert_from_dlpack(lse_log2.detach(), leading_dim=lse_log2.ndim - 1, alignment=16)
+        dpsum_tensor = utils.convert_from_dlpack(dpsum.detach(), leading_dim=dpsum.ndim - 1, alignment=16)
+        dq_accum_tensor = utils.convert_from_dlpack(dq_accum.detach(), leading_dim=dq_accum.ndim - 1, alignment=16)
         if qhead_per_kvhead > 1:
-            dk_accum_tensor = from_dlpack(dk_accum.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dk_accum.ndim - 1)
-            dv_accum_tensor = from_dlpack(dv_accum.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dv_accum.ndim - 1)
+            dk_accum_tensor = utils.convert_from_dlpack(dk_accum.detach(), leading_dim=dk_accum.ndim - 1, alignment=16)
+            dv_accum_tensor = utils.convert_from_dlpack(dv_accum.detach(), leading_dim=dv_accum.ndim - 1, alignment=16)
         cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor = [
-            from_dlpack(t.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=t.ndim - 1)
+            utils.convert_from_dlpack(t.detach(), leading_dim=t.ndim - 1, alignment=4)
             if t is not None
             else None
             for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
@@ -906,7 +906,7 @@ def _flash_attn_bwd(
             cute_block_sparse_tensors = to_cute_linear_block_sparse_tensors(block_sparse_tensors)
         cute_aux_tensors = None
         if aux_tensors is not None:
-            cute_aux_tensors = [from_dlpack(buf, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=buf.ndim - 1) for buf in aux_tensors]
+            cute_aux_tensors = [utils.convert_from_dlpack(buf, leading_dim=buf.ndim - 1) for buf in aux_tensors]
         
         fa_bwd_sm80 = FlashAttentionBackwardSm80(
             dtype,
@@ -1020,10 +1020,10 @@ def _flash_attn_bwd(
     compile_key_post = (dtype, head_dim, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB)
     if compile_key_post not in _flash_attn_bwd.compile_cache_post:
         # Only create from_dlpack tensors when compilation is needed
-        dq_accum_tensor = from_dlpack(dq_accum.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dq_accum.ndim - 1)
-        dq_tensor = from_dlpack(dq.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dq.ndim - 1)
-        cu_seqlens_q_tensor = from_dlpack(cu_seqlens_q.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=cu_seqlens_q.ndim - 1) if cu_seqlens_q is not None else None
-        seqused_q_tensor = from_dlpack(seqused_q.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=seqused_q.ndim - 1) if seqused_q is not None else None
+        dq_accum_tensor = utils.convert_from_dlpack(dq_accum.detach(), leading_dim=dq_accum.ndim - 1, alignment=16)
+        dq_tensor = utils.convert_from_dlpack(dq.detach(), leading_dim=dq.ndim - 1, alignment=16)
+        cu_seqlens_q_tensor = utils.convert_from_dlpack(cu_seqlens_q.detach(), leading_dim=cu_seqlens_q.ndim - 1, alignment=4) if cu_seqlens_q is not None else None
+        seqused_q_tensor = utils.convert_from_dlpack(seqused_q.detach(), leading_dim=seqused_q.ndim - 1, alignment=4) if seqused_q is not None else None
         
         arch = compute_capability * 10
         fa_bwd_post = FlashAttentionBackwardPostprocess(
@@ -1055,10 +1055,10 @@ def _flash_attn_bwd(
         compile_key_post = (dtype, head_dim, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB)
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
             # Only create from_dlpack tensors when compilation is needed
-            dk_accum_tensor = from_dlpack(dk_accum.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dk_accum.ndim - 1)
-            dk_tensor = from_dlpack(dk.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dk.ndim - 1)
-            cu_seqlens_k_tensor = from_dlpack(cu_seqlens_k.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=cu_seqlens_k.ndim - 1) if cu_seqlens_k is not None else None
-            seqused_k_tensor = from_dlpack(seqused_k.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=seqused_k.ndim - 1) if seqused_k is not None else None
+            dk_accum_tensor = utils.convert_from_dlpack(dk_accum.detach(), leading_dim=dk_accum.ndim - 1, alignment=16)
+            dk_tensor = utils.convert_from_dlpack(dk.detach(), leading_dim=dk.ndim - 1, alignment=16)
+            cu_seqlens_k_tensor = utils.convert_from_dlpack(cu_seqlens_k.detach(), leading_dim=cu_seqlens_k.ndim - 1, alignment=4) if cu_seqlens_k is not None else None
+            seqused_k_tensor = utils.convert_from_dlpack(seqused_k.detach(), leading_dim=seqused_k.ndim - 1, alignment=4) if seqused_k is not None else None
             
             fa_bwd_post = FlashAttentionBackwardPostprocess(
                 dtype, head_dim, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
@@ -1093,10 +1093,10 @@ def _flash_attn_bwd(
         )
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
             # Only create from_dlpack tensors when compilation is needed
-            dv_accum_tensor = from_dlpack(dv_accum.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dv_accum.ndim - 1)
-            dv_tensor = from_dlpack(dv.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dv.ndim - 1)
-            cu_seqlens_k_tensor = from_dlpack(cu_seqlens_k.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=cu_seqlens_k.ndim - 1) if cu_seqlens_k is not None else None
-            seqused_k_tensor = from_dlpack(seqused_k.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=seqused_k.ndim - 1) if seqused_k is not None else None
+            dv_accum_tensor = utils.convert_from_dlpack(dv_accum.detach(), leading_dim=dv_accum.ndim - 1, alignment=16)
+            dv_tensor = utils.convert_from_dlpack(dv.detach(), leading_dim=dv.ndim - 1, alignment=16)
+            cu_seqlens_k_tensor = utils.convert_from_dlpack(cu_seqlens_k.detach(), leading_dim=cu_seqlens_k.ndim - 1, alignment=4) if cu_seqlens_k is not None else None
+            seqused_k_tensor = utils.convert_from_dlpack(seqused_k.detach(), leading_dim=seqused_k.ndim - 1, alignment=4) if seqused_k is not None else None
             
             fa_bwd_post = FlashAttentionBackwardPostprocess(
                 dtype, head_dim_v, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
@@ -1448,20 +1448,20 @@ def _flash_attn_fwd_combine(
 
     if compile_key not in _flash_attn_fwd_combine.compile_cache:
         # Only create from_dlpack tensors when compilation is needed
-        out_partial_tensor = from_dlpack(out_partial.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(
-            leading_dim=4 if not is_varlen else 3
+        out_partial_tensor = utils.convert_from_dlpack(
+            out_partial.detach(), leading_dim=4 if not is_varlen else 3, alignment=16
         )
-        lse_partial_tensor = from_dlpack(lse_partial.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
-            leading_dim=lse_partial.ndim - 2
+        lse_partial_tensor = utils.convert_from_dlpack(
+            lse_partial.detach(), leading_dim=lse_partial.ndim - 2, alignment=4
         )
-        out_tensor = from_dlpack(out.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=3 if not is_varlen else 2)
+        out_tensor = utils.convert_from_dlpack(out.detach(), leading_dim=3 if not is_varlen else 2, alignment=16)
         lse_tensor = (
-            from_dlpack(lse.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=lse.ndim - 2)
+            utils.convert_from_dlpack(lse.detach(), leading_dim=lse.ndim - 2, alignment=4)
             if lse is not None
             else None
         )
         optional_tensors = [
-            from_dlpack(t.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=0)
+            utils.convert_from_dlpack(t.detach(), leading_dim=0, alignment=4)
             if t is not None
             else None
             for t in (cu_seqlens, seqused, num_splits_dynamic_ptr, semaphore_to_reset)

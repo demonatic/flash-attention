@@ -12,6 +12,7 @@ from typing import Tuple, Optional, Callable, List, NamedTuple
 import torch
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
+from flash_attn_cute import utils
 
 
 # placeholder
@@ -172,23 +173,19 @@ def to_cute_block_sparse_tensors(tensors: BlockSparseTensorsTorch) -> Optional[B
     if not is_block_sparsity_enabled(tensors):
         return None
 
-    mask_block_cnt_tensor = from_dlpack(
-        tensors.mask_block_cnt.detach(), assumed_align=4, enable_tvm_ffi=True
-    ).mark_layout_dynamic(leading_dim=2)
-    mask_block_idx_tensor = from_dlpack(
-        tensors.mask_block_idx.detach(), assumed_align=4, enable_tvm_ffi=True
-    ).mark_layout_dynamic(leading_dim=3)
+    mask_block_cnt_tensor = utils.convert_from_dlpack(
+        tensors.mask_block_cnt.detach(), leading_dim=2, alignment=4
+    )
+    mask_block_idx_tensor = utils.convert_from_dlpack(
+        tensors.mask_block_idx.detach(), leading_dim=3, alignment=4
+    )
     full_block_cnt_tensor = (
-        from_dlpack(tensors.full_block_cnt.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
-            leading_dim=2
-        )
+        utils.convert_from_dlpack(tensors.full_block_cnt.detach(), leading_dim=2, alignment=4)
         if tensors.full_block_cnt is not None
         else None
     )
     full_block_idx_tensor = (
-        from_dlpack(tensors.full_block_idx.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
-            leading_dim=3
-        )
+        utils.convert_from_dlpack(tensors.full_block_idx.detach(), leading_dim=3, alignment=4)
         if tensors.full_block_idx is not None
         else None
     )
@@ -218,33 +215,27 @@ def to_cute_linear_block_sparse_tensors(tensors: LinearBlockSparseTensorsTorch) 
     if not is_block_sparsity_enabled(tensors):
         return None
 
-    mask_block_cnt_tensor = from_dlpack(
-        tensors.mask_block_cnt.detach(), assumed_align=4, enable_tvm_ffi=True
-    ).mark_layout_dynamic(leading_dim=0)
-    mask_block_offset_tensor = from_dlpack(
-        tensors.mask_block_offset.detach(), assumed_align=4, enable_tvm_ffi=True
-    ).mark_layout_dynamic(leading_dim=0)
-    mask_block_idx_tensor = from_dlpack(
-        tensors.mask_block_idx.detach(), assumed_align=4, enable_tvm_ffi=True
-    ).mark_layout_dynamic(leading_dim=0)
+    mask_block_cnt_tensor = utils.convert_from_dlpack(
+        tensors.mask_block_cnt.detach(), leading_dim=0, alignment=4
+    )
+    mask_block_offset_tensor = utils.convert_from_dlpack(
+        tensors.mask_block_offset.detach(), leading_dim=0, alignment=4
+    )
+    mask_block_idx_tensor = utils.convert_from_dlpack(
+        tensors.mask_block_idx.detach(), leading_dim=0, alignment=4
+    )
     full_block_cnt_tensor = (
-        from_dlpack(tensors.full_block_cnt.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
-            leading_dim=0
-        )
+        utils.convert_from_dlpack(tensors.full_block_cnt.detach(), leading_dim=0, alignment=4)
         if tensors.full_block_cnt is not None
         else None
     )
     full_block_offset_tensor = (
-        from_dlpack(
-            tensors.full_block_offset.detach(), assumed_align=4, enable_tvm_ffi=True
-        ).mark_layout_dynamic(leading_dim=0)
+        utils.convert_from_dlpack(tensors.full_block_offset.detach(), leading_dim=0, alignment=4)
         if tensors.full_block_offset is not None
         else None
     )
     full_block_idx_tensor = (
-        from_dlpack(tensors.full_block_idx.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
-            leading_dim=0
-        )
+        utils.convert_from_dlpack(tensors.full_block_idx.detach(), leading_dim=0, alignment=4)
         if tensors.full_block_idx is not None
         else None
     )
