@@ -391,17 +391,15 @@ def _flash_attn_fwd(
         compute_capability,
         page_size not in [None, 128],  # paged KV non-TMA
     )
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    print(
-        f"rank {rank} _flash_attn_fwd.compile_cache id={id(_flash_attn_fwd.compile_cache)}, "
-        f"len={len(_flash_attn_fwd.compile_cache)}, "
-        f"keys={list(_flash_attn_fwd.compile_cache.keys())}, "
-        f"current compile_key={compile_key}, "
-        f"hit={compile_key in _flash_attn_fwd.compile_cache}",
-        flush=True,
-    )
     if compile_key not in _flash_attn_fwd.compile_cache:
-        print(f"rank {rank} Compiling flash_attn_fwd with compile_key: {compile_key}", flush=True)
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        print(
+            f"rank {rank} Compiling flash_attn_fwd with compile_key: {compile_key}, "
+            f"compile_cache id={id(_flash_attn_fwd.compile_cache)}, "
+            f"len={len(_flash_attn_fwd.compile_cache)}, "
+            f"keys={list(_flash_attn_fwd.compile_cache.keys())}",
+            flush=True,
+        )
         # Only create from_dlpack tensors when compilation is needed
         q_tensor, k_tensor, v_tensor, o_tensor = [
             from_dlpack(t.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=t.ndim - 1)
