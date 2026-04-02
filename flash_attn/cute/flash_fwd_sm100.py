@@ -88,6 +88,7 @@ class FlashAttentionForwardSm100:
         has_aux_tensors: cutlass.Constexpr = False,
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
+        return_max_score: bool = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -120,6 +121,7 @@ class FlashAttentionForwardSm100:
         self.func_num = func_num
         self.is_varlen_q = is_varlen_q
         self.use_correction_warps_for_epi = is_varlen_q
+        self.return_max_score = return_max_score
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_split_kv = is_split_kv
         self.pack_gqa = pack_gqa
@@ -267,6 +269,7 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[LinearBlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        mMaxScore: Optional[cute.Tensor] = None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -317,6 +320,15 @@ class FlashAttentionForwardSm100:
             if const_expr(mLSE is not None)
             else None
         )
+        if cutlass.const_expr(self.return_max_score):
+            if const_expr(mCuSeqlensQ is None):
+                MaxScore_layout_transpose = [2, 3, 1, 0]
+            else:
+                MaxScore_layout_transpose = [1, 2, 0]
+            mMaxScore = cute.make_tensor(
+                mMaxScore.iterator,
+                cute.select(mMaxScore.layout, mode=MaxScore_layout_transpose),
+            )
         # (s, d, h, b) -> (d, s, h, b)
         V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
         mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
@@ -708,6 +720,7 @@ class FlashAttentionForwardSm100:
             num_splits,
             aux_tensors,
             fastdiv_mods,
+            mMaxScore,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -754,6 +767,7 @@ class FlashAttentionForwardSm100:
         num_splits: Int32,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
+        mMaxScore: Optional[cute.Tensor] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1061,6 +1075,8 @@ class FlashAttentionForwardSm100:
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
                 blocksparse_tensors=blocksparse_tensors,
+                mMaxScore=mMaxScore,
+                mCuSeqlensQ=mCuSeqlensQ,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -1556,6 +1572,8 @@ class FlashAttentionForwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[LinearBlockSparseTensors] = None,
+        mMaxScore: Optional[cute.Tensor] = None,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -1689,6 +1707,8 @@ class FlashAttentionForwardSm100:
                 seqlen=seqlen,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
+                mMaxScore=mMaxScore,
+                mCuSeqlensQ=mCuSeqlensQ,
             )
 
             if has_work:
@@ -1850,6 +1870,8 @@ class FlashAttentionForwardSm100:
         seqlen,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
+        mMaxScore: Optional[cute.Tensor] = None,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
@@ -1893,6 +1915,21 @@ class FlashAttentionForwardSm100:
 
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block)
+        if cutlass.const_expr(self.return_max_score):
+            block_row_max = utils.fmax_reduce(tSrS_t2r.load(), None, arch=100)
+            thread_idx_ms = thr_tmem_load.thr_idx
+            if const_expr(mCuSeqlensQ is None):
+                mMax_cur = mMaxScore[None, None, head_idx, batch_idx]
+            else:
+                mMax_cur = cute.domain_offset((seqlen.offset_q,), mMaxScore[None, head_idx])
+            gMC = cute.local_tile(mMax_cur, (self.m_block_size, 1), (m_block, n_block))
+            seqlen_q_ms = (
+                seqlen.seqlen_q
+                if const_expr(not self.pack_gqa)
+                else seqlen.seqlen_q * self.qhead_per_kvhead
+            )
+            if thread_idx_ms < seqlen_q_ms - m_block * self.m_block_size:
+                gMC[thread_idx_ms, 0] = block_row_max
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
 
         if const_expr(not is_first):

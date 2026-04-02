@@ -4,6 +4,8 @@ from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
+# Project root contains hopper/tile_size.h - for determining tile sizes in sparsity blocks
+project_root = os.path.abspath(os.path.join(this_dir, "..", "..", ".."))
 
 # ============================================================================
 # Optimization Control via Environment Variables (for benchmarking)
@@ -46,6 +48,33 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 #   DISABLE_REG_CACHE=1 DISABLE_KV_RANGE_OPT=1 DISABLE_BLOCK_SIZE_TEMPLATE=1 python setup.py build_ext --inplace
 # ============================================================================
 
+import torch
+
+BUILD_COMPUTE_CAPABILITY = os.getenv("MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY", "")
+
+def get_cuda_gencode_flags():
+    """Detect current GPU architecture and return appropriate -gencode flags."""
+    if BUILD_COMPUTE_CAPABILITY:
+        print(f"Using build compute capability from environment variable: {BUILD_COMPUTE_CAPABILITY}")
+        arch = BUILD_COMPUTE_CAPABILITY
+    else:
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA is not available and MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY is not set, cannot determine target architecture. "
+                "Please set MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY to the compute capability of your GPU (e.g. 80 for Ampere, 90 for Hopper)."
+            )
+        capability = torch.cuda.get_device_capability()
+        arch = capability[0] * 10 + capability[1]
+    flags = []
+    for a in str(arch).split(","):
+        a = a.strip()
+        if not a:
+            continue
+        flags += ["-gencode", f"arch=compute_{a},code=sm_{a}"]
+    return flags
+
+cuda_gencode_flags = get_cuda_gencode_flags()
+
 extra_defines = []
 disable_reg_cache = os.environ.get("DISABLE_REG_CACHE")
 disable_kv_range_opt = os.environ.get("DISABLE_KV_RANGE_OPT")
@@ -87,12 +116,9 @@ setup(
                 "nvcc": [
                     "-O3",
                     "--use_fast_math",
-                    "-gencode", "arch=compute_80,code=sm_80",
-                    "-gencode", "arch=compute_90,code=sm_90",
-                    "-gencode", "arch=compute_100,code=sm_100",
-                ] + extra_defines,
+                ] + cuda_gencode_flags + extra_defines,
             },
-            include_dirs=[this_dir],
+            include_dirs=[this_dir, project_root],  # project_root for hopper/tile_size.h
         )
     ],
     cmdclass={"build_ext": BuildExtension},

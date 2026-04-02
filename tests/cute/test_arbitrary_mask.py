@@ -21,7 +21,7 @@ import torch
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 import torch.nn.functional as F
 
-from flash_attn.cute.interface import flash_attn_func
+from flash_attn.cute.interface import flash_attn_func, _flash_attn_fwd
 from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch, bhqk_to_linear_sparse_tensors, LinearBlockSparseTensorsTorch
 
 # Import CUDA kernel for create_block_mask
@@ -226,6 +226,75 @@ def compute_reference_arbitrary(tensors, arbitrary_func, up_cast=False):
     if is_all_zero:
         out[:] = 0.0
 
+    return out
+
+
+def compute_reference_block_max_scores(tensors, arbitrary_func=None):
+    """Per (batch, head, q_pos), max of QK (optionally arbitrary-masked) per K-tile of 128.
+
+    Matches SM100 ``max_score_out``: raw QK^T **before** ``1/sqrt(d)`` softmax scale, BF16
+    GEMM accumulated in FP32; optional ``apply_arbitrary_mask_to_qk`` when ``arbitrary_func``
+    is set (note: may diverge from kernel for dense arbitrary; use ``None`` for strict checks).
+    """
+    q = tensors["q"]
+    k = tensors["k"]
+    batch_size = q.shape[0]
+    seqlen_q = q.shape[1]
+    seqlen_k = k.shape[1]
+    nheads = q.shape[2]
+    nheads_kv = k.shape[2]
+
+    if nheads_kv == nheads:
+        qk_attn = torch.einsum("bnhd,bmhd->bhnm", q, k).to(torch.float32)
+    else:
+        k_exp = repeat(k, "b s h d -> b s (h g) d", g=nheads // nheads_kv)
+        qk_attn = torch.einsum("bnhd,bmhd->bhnm", q, k_exp).to(torch.float32)
+
+    if arbitrary_func is not None:
+        qk_attn = apply_arbitrary_mask_to_qk(
+            qk_attn, arbitrary_func, seqlen_q, seqlen_k
+        )
+
+    pad = (128 - (seqlen_k % 128)) % 128
+    if pad:
+        qk_attn = F.pad(qk_attn, (0, pad), value=float("-inf"))
+    num_chunks = qk_attn.shape[-1] // 128
+    qk_chunks = qk_attn.view(batch_size, nheads, seqlen_q, num_chunks, 128)
+    return qk_chunks.amax(dim=-1).contiguous()
+
+
+def apply_block_sparse_unvisited_to_max_score(
+    ref_dense: torch.Tensor,
+    linear_k: LinearBlockSparseTensorsTorch,
+    seqlen_q: int,
+    q_super_block: int,
+) -> torch.Tensor:
+    """Set ``max_score`` slots to ``-inf`` for K-blocks not in the forward sparse list per Q super-block.
+
+    ``linear_k`` must match ``create_block_mask(..., BLOCK_SIZE=(q_super_block, 128))`` used for Q2K.
+    """
+    out = ref_dense.clone()
+    _, _, _, n_chunks = out.shape
+    num_qb = (seqlen_q + q_super_block - 1) // q_super_block
+    assert int(linear_k.mask_block_offset.shape[0]) == num_qb + 1, (
+        f"mask_block_offset len {linear_k.mask_block_offset.shape[0]} != num_qb+1={num_qb + 1}"
+    )
+    for m in range(num_qb):
+        q_lo = m * q_super_block
+        q_hi = min((m + 1) * q_super_block, seqlen_q)
+        s = int(linear_k.mask_block_offset[m].item())
+        e = int(linear_k.mask_block_offset[m + 1].item())
+        mask_nb = linear_k.mask_block_idx[s:e].long()
+        parts = [mask_nb]
+        if linear_k.full_block_idx is not None and linear_k.full_block_offset is not None:
+            fs = int(linear_k.full_block_offset[m].item())
+            fe = int(linear_k.full_block_offset[m + 1].item())
+            parts.append(linear_k.full_block_idx[fs:fe].long())
+        visited = torch.cat(parts)
+        visited = visited[(visited >= 0) & (visited < n_chunks)]
+        vis = torch.zeros(n_chunks, dtype=torch.bool, device=out.device)
+        vis[visited] = True
+        out[:, :, q_lo:q_hi, ~vis] = float("-inf")
     return out
 
 
@@ -542,6 +611,178 @@ def _run_mask_test(
     assert (dv - dv_ref_fp32).abs().max().item() <= 5 * (dv_ref - dv_ref_fp32).abs().max().item()
     assert (dk - dk_ref_fp32).abs().max().item() <= 5 * (dk_ref - dk_ref_fp32).abs().max().item()
     assert (dq - dq_ref_fp32).abs().max().item() <= 5 * (dq_ref - dq_ref_fp32).abs().max().item()
+
+
+def test_arbitrary_mask_block_score():
+    """``max_score_out`` vs BF16 QK block-max reference (dense bidirectional, SM100 only).
+
+    Dense forward only (no ``block_sparse_tensors``); see ``test_arbitrary_mask_block_score_sparse``
+    for block-sparse + ``max_score_out``. If ``import flash_attn_cute`` resolves to an older
+    ``dist-packages`` build without
+    ``return_max_score``, use editable install from ``flash_attn/cute`` or prepend a
+    ``PYTHONPATH`` that points a ``flash_attn_cute`` package dir at the repo ``cute`` sources.
+    """
+    if COMPUTE_CAPABILITY != 10:
+        pytest.skip("max_score_out is only implemented on SM 10.x cute forward")
+
+    seqlen_q, seqlen_k = 256, 256
+    nheads = 4
+    headdim = 128
+    dtype = torch.bfloat16
+    batch_size = 1
+    nheads_kv = nheads
+
+    tensors = create_tensors(
+        batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim, dtype
+    )
+    headdim = tensors["q"].shape[3]
+    softmax_scale = 1.0 / math.sqrt(headdim)
+
+    num_k_chunks = (seqlen_k + 127) // 128
+    max_score_out = torch.empty(
+        batch_size, nheads, seqlen_q, num_k_chunks,
+        dtype=torch.float32,
+        device="cuda",
+    )
+
+    out, lse = _flash_attn_fwd(
+        tensors["q"],
+        tensors["k"],
+        tensors["v"],
+        softmax_scale=softmax_scale,
+        causal=False,
+        arbitrary=False,
+        window_size_left=None,
+        window_size_right=None,
+        learnable_sink=None,
+        softcap=0.0,
+        num_splits=1,
+        pack_gqa=False,
+        mask_mod=None,
+        block_sparse_tensors=None,
+        aux_tensors=None,
+        max_score_out=max_score_out,
+        k_sparse_block_size=128,
+    )
+
+    ref_max = compute_reference_block_max_scores(tensors, arbitrary_func=None)
+    assert out.shape == tensors["out"].shape
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(max_score_out).all()
+
+    diff = (max_score_out - ref_max).abs()
+    assert torch.allclose(
+        max_score_out,
+        ref_max,
+        rtol=0.06,
+        atol=0.2,
+    ), f"max_score mismatch max diff {diff.max().item()}"
+
+    _ = lse
+
+
+def test_arbitrary_mask_block_score_sparse():
+    """``max_score_out`` with linear K block sparsity + arbitrary mask (SM100).
+
+    Reference: dense BF16 QK block maxima with ``apply_arbitrary_mask_to_qk``, then ``-inf`` for
+    K-chunks not listed in ``linear_k`` for each Q super-block (``2 * tile_m`` = 256 when
+    ``tile_m == 128`` on SM100), matching ``create_block_mask`` / forward Q2K CSR layout.
+    """
+    if COMPUTE_CAPABILITY != 10:
+        pytest.skip("max_score_out block-sparse path is only exercised on SM 10.x")
+
+    torch.manual_seed(0)
+
+    seqlen_q, seqlen_k = 256, 256
+    tile_m, tile_n = 128, 128
+    sparse_tile_m = 2 * tile_m
+    nheads = 4
+    nheads_kv = nheads
+    headdim = 128
+    dtype = torch.bfloat16
+    batch_size = 1
+
+    _, mask_mod_flex = get_mask_pair("arbitrary")
+    arbitrary_func = random_arbitrary_func_tensor(
+        1, 1, 3, seqlen_q, seqlen_k, device="cuda"
+    )
+    frozen_af = arbitrary_func
+
+    def mask_mod_wrap(b, h, q_idx, kv_idx, f=frozen_af):
+        return mask_mod_flex(b, h, q_idx, kv_idx, f)
+
+    tensors = create_tensors(
+        batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim, dtype
+    )
+    headdim = tensors["q"].shape[3]
+    softmax_scale = 1.0 / math.sqrt(headdim)
+
+    bm = create_block_mask(
+        mask_mod_wrap,
+        1,
+        1,
+        seqlen_q,
+        seqlen_k,
+        device="cuda",
+        BLOCK_SIZE=(sparse_tile_m, tile_n),
+    )
+    _, _, k_mask_cnt, k_mask_idx, k_full_cnt, k_full_idx, *_ = bm.as_tuple()
+    k_bsm = BlockSparseTensorsTorch(
+        mask_block_cnt=k_mask_cnt,
+        mask_block_idx=k_mask_idx,
+        full_block_cnt=k_full_cnt,
+        full_block_idx=k_full_idx,
+    )
+    linear_k = bhqk_to_linear_sparse_tensors(k_bsm)
+
+    num_k_chunks = (seqlen_k + 127) // 128
+    max_score_out = torch.empty(
+        batch_size,
+        nheads,
+        seqlen_q,
+        num_k_chunks,
+        dtype=torch.float32,
+        device="cuda",
+    )
+
+    out, lse = _flash_attn_fwd(
+        tensors["q"],
+        tensors["k"],
+        tensors["v"],
+        softmax_scale=softmax_scale,
+        causal=False,
+        arbitrary=True,
+        window_size_left=None,
+        window_size_right=None,
+        learnable_sink=None,
+        softcap=0.0,
+        num_splits=1,
+        pack_gqa=False,
+        mask_mod=None,
+        block_sparse_tensors=linear_k,
+        aux_tensors=[arbitrary_func],
+        max_score_out=max_score_out,
+        k_sparse_block_size=128,
+    )
+
+    ref_dense = compute_reference_block_max_scores(tensors, arbitrary_func)
+    ref = apply_block_sparse_unvisited_to_max_score(
+        ref_dense, linear_k, seqlen_q, sparse_tile_m
+    )
+
+    assert out.shape == tensors["out"].shape
+    assert torch.isfinite(out).all()
+
+    diff = (max_score_out - ref).abs()
+    assert torch.allclose(
+        max_score_out,
+        ref,
+        rtol=0.06,
+        atol=0.001,
+    ), f"sparse max_score mismatch max diff {diff.max().item()}"
+
+    print(f"max_score_out: {max_score_out} ref: {ref} diff max: {diff.max().item()} diff avg: {diff.mean().item()}")
+    _ = lse
 
 
 def test_arbitrary_mask(

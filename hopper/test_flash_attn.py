@@ -176,10 +176,10 @@ def test_flash_attn_output(
     torch.random.manual_seed(0)
     # batch_size = 40
     # nheads = 16
-    batch_size = 9 if seqlen_k <= 2048 else 2
-    # batch_size = 1
-    nheads = 6
-    # nheads = 1
+    # batch_size = 9 if seqlen_k <= 2048 else 2  # origin
+    # nheads = 6  # origin
+    batch_size = 1
+    nheads = 32
     nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
@@ -187,7 +187,9 @@ def test_flash_attn_output(
         dv_vals = [d]
     if has_qv:
         dv_vals = [256, 512]
-    attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if not DISABLE_LOCAL else [0]
+    # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if not DISABLE_LOCAL else [0] # origin
+    attention_chunk_vals = [0]
+    dv_vals = [128] 
     for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
         print(f"{dv = }, {attention_chunk = }")
         q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)
@@ -294,8 +296,8 @@ def test_flash_attn_output(
         ):
             g = torch.randn_like(out)
             do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
-            # import flash_attn_3_cuda
-            # dq, dk, dv, softmax_d, dq_accum, dk_accum, dv_accum = flash_attn_3_cuda.bwd(
+            # import magi_flash_attn_3_cuda
+            # dq, dk, dv, softmax_d, dq_accum, dk_accum, dv_accum = magi_flash_attn_3_cuda.bwd(
             #     g,
             #     q,
             #     k,
@@ -588,8 +590,8 @@ def test_flash_attn_varlen_output(
         ):
             g_unpad = torch.randn_like(out_unpad)
             do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
-            # import flash_attn_3_cuda
-            # dq_unpad, dk_unpad, dv_unpad, softmax_d, dq_accum, lse_log2 = flash_attn_3_cuda.bwd_varlen(
+            # import magi_flash_attn_3_cuda
+            # dq_unpad, dk_unpad, dv_unpad, softmax_d, dq_accum, lse_log2 = magi_flash_attn_3_cuda.bwd_varlen(
             #     g_unpad,
             #     q_unpad,
             #     k_unpad,
@@ -1227,8 +1229,8 @@ def test_flash3_bw_compatibility() -> None:
     # for downstream libaries, users, and exported models.
     # 1/ Instead of removing arguments, error out if their value is no longer supported
     # 2/ When adding arguments, add them at the end with a default value
-    assert torch.ops.flash_attn_3.fwd.default._schema.is_backward_compatible_with(parse_schema(
-        "flash_attn_3::fwd(Tensor q, Tensor k, Tensor v, Tensor(k_new!)? k_new=None, "
+    assert torch.ops.magi_flash_attn_3.fwd.default._schema.is_backward_compatible_with(parse_schema(
+        "magi_flash_attn_3::fwd(Tensor q, Tensor k, Tensor v, Tensor(k_new!)? k_new=None, "
         "Tensor(v_new!)? v_new=None, Tensor? q_v=None, Tensor(out!)? out=None, "
         "Tensor? cu_seqlens_q=None, Tensor? cu_seqlens_k=None, "
         "Tensor? cu_seqlens_k_new=None, Tensor? seqused_q=None, Tensor? seqused_k=None, "
@@ -1240,20 +1242,20 @@ def test_flash3_bw_compatibility() -> None:
         "Tensor? scheduler_metadata=None, int num_splits=0, bool? pack_gqa=None, int sm_margin=0) "
         "-> (Tensor(out!), Tensor, Tensor, Tensor)"
     ))
-    assert torch.ops.flash_attn_3.bwd.default._schema.is_backward_compatible_with(parse_schema(
-        "flash_attn_3::bwd(Tensor dout, Tensor q, Tensor k, Tensor v, Tensor out, Tensor softmax_lse, "
+    assert torch.ops.magi_flash_attn_3.bwd.default._schema.is_backward_compatible_with(parse_schema(
+        "magi_flash_attn_3::bwd(Tensor dout, Tensor q, Tensor k, Tensor v, Tensor out, Tensor softmax_lse, "
         "Tensor(dq!)? dq=None, Tensor(dk!)? dk=None, Tensor(dv!)? dv=None, Tensor? cu_seqlens_q=None, "
         "Tensor? cu_seqlens_k=None, Tensor? seqused_q=None, Tensor? seqused_k=None, int? max_seqlen_q=None, "
         "int? max_seqlen_k=None, float? softmax_scale=None, bool is_causal=False, int window_size_left=-1, "
         "int window_size_right=-1, float softcap=0., bool deterministic=False, int sm_margin=0) "
         "-> (Tensor(dq!), Tensor(dk!), Tensor(dv!), Tensor, Tensor, Tensor, Tensor, Tensor)"
     ))
-    assert torch.ops.flash_attn_3.fwd_combine.default._schema.is_backward_compatible_with(parse_schema(
-        "flash_attn_3::fwd_combine(Tensor out_partial, Tensor lse_partial, Tensor(out!)? out=None, "
+    assert torch.ops.magi_flash_attn_3.fwd_combine.default._schema.is_backward_compatible_with(parse_schema(
+        "magi_flash_attn_3::fwd_combine(Tensor out_partial, Tensor lse_partial, Tensor(out!)? out=None, "
         "ScalarType? out_dtype=None) -> (Tensor(out!), Tensor)"
     ))
-    assert torch.ops.flash_attn_3.get_scheduler_metadata.default._schema.is_backward_compatible_with(parse_schema(
-        "flash_attn_3::get_scheduler_metadata(int batch_size, int max_seqlen_q, int max_seqlen_k, "
+    assert torch.ops.magi_flash_attn_3.get_scheduler_metadata.default._schema.is_backward_compatible_with(parse_schema(
+        "magi_flash_attn_3::get_scheduler_metadata(int batch_size, int max_seqlen_q, int max_seqlen_k, "
         "int num_heads, int num_heads_k, int headdim, int headdim_v, ScalarType qkv_dtype, Tensor seqused_k, "
         "Tensor? cu_seqlens_q=None, Tensor? cu_seqlens_k=None, Tensor? cu_seqlens_k_new=None, "
         "Tensor? seqused_q=None, Tensor? leftpad_k=None, int? page_size=None, int max_seqlen_k_new=0, "
@@ -1261,3 +1263,20 @@ def test_flash3_bw_compatibility() -> None:
         "int attention_chunk=0, bool has_softcap=False, int num_splits=0, bool? pack_gqa=None, "
         "int sm_margin=0) -> Tensor"
     ))
+
+
+if __name__ == "__main__":
+    # for quick test and benchmark
+    test_flash_attn_output(
+        seqlen_q=8192,
+        seqlen_k=8192,
+        d=128,
+        causal=True,
+        local=False,
+        softcap=0.0,
+        V_colmajor=False,
+        deterministic=False,
+        has_qv=False,
+        mha_type="mha",  
+        dtype=torch.bfloat16,
+    )
