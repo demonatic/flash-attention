@@ -117,11 +117,11 @@ def _flash_attn_fwd(
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
-        max_score_out: Optional output for per-query-token max attention logits over each K-block of
-            size ``k_sparse_block_size`` (same as ``n_block_size``; must be 128 on SM100).
+        max_score_out: If not ``None`` (SM100 only), enables the extra per-K-block row ``fmax_reduce``
+            in the softmax warp. Block maxima are stored in shared memory only; this tensor is **not**
+            written (callers may still pass a correctly shaped buffer for API/compile consistency).
             Shape: ``(batch, num_head, seqlen_q, ceil(seqlen_k / k_sparse_block_size))`` for fixed-length,
-            or ``(num_head, total_q, num_chunks)`` when ``cu_seqlens_q`` is set. Dtype float32, filled in-place.
-            With block sparsity, K-blocks that are never visited keep the initial ``-inf`` fill.
+            or ``(num_head, total_q, num_chunks)`` when ``cu_seqlens_q`` is set. Dtype float32.
         k_sparse_block_size: K-axis chunk size for max score reduction; must equal ``n_block_size`` (128).
     """
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
@@ -261,9 +261,12 @@ def _flash_attn_fwd(
 
     assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
     if max_score_out is not None:
-        assert compute_capability == 10, "max_score_out is only supported on SM 10.x (Blackwell / FA4 cute path)"
+        assert compute_capability == 10, (
+            "max_score_out is only supported on SM 10.x (Blackwell / FA4 cute path)"
+        )
         assert k_sparse_block_size == n_block_size, (
-            f"k_sparse_block_size ({k_sparse_block_size}) must equal n_block_size ({n_block_size}) for max_score_out"
+            f"k_sparse_block_size ({k_sparse_block_size}) must equal n_block_size ({n_block_size}) "
+            "for max_score_out"
         )
 
     use_block_sparsity = block_sparse_tensors is not None
@@ -472,9 +475,7 @@ def _flash_attn_fwd(
             cute_aux_tensors = [from_dlpack(buf, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=buf.ndim - 1) for buf in aux_tensors]
 
         max_score_tensor = (
-            from_dlpack(max_score_out.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
-                leading_dim=max_score_out.ndim - 1
-            )
+            from_dlpack(max_score_out.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=max_score_out.ndim - 1)
             if max_score_out is not None
             else None
         )

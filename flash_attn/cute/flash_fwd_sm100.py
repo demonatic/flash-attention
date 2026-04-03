@@ -323,12 +323,10 @@ class FlashAttentionForwardSm100:
         if cutlass.const_expr(self.return_max_score):
             if const_expr(mCuSeqlensQ is None):
                 MaxScore_layout_transpose = [2, 3, 1, 0]
-            else:
-                MaxScore_layout_transpose = [1, 2, 0]
-            mMaxScore = cute.make_tensor(
-                mMaxScore.iterator,
-                cute.select(mMaxScore.layout, mode=MaxScore_layout_transpose),
-            )
+                mMaxScore = cute.make_tensor(
+                    mMaxScore.iterator,
+                    cute.select(mMaxScore.layout, mode=MaxScore_layout_transpose),
+                )
         # (s, d, h, b) -> (d, s, h, b)
         V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
         mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
@@ -1125,6 +1123,7 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 TileSchedulerCls,
                 blocksparse_tensors,
+                mMaxScore,
             )
             cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
 
@@ -1918,18 +1917,17 @@ class FlashAttentionForwardSm100:
         if cutlass.const_expr(self.return_max_score):
             block_row_max = utils.fmax_reduce(tSrS_t2r.load(), None, arch=100)
             thread_idx_ms = thr_tmem_load.thr_idx
-            if const_expr(mCuSeqlensQ is None):
-                mMax_cur = mMaxScore[None, None, head_idx, batch_idx]
-            else:
-                mMax_cur = cute.domain_offset((seqlen.offset_q,), mMaxScore[None, head_idx])
-            gMC = cute.local_tile(mMax_cur, (self.m_block_size, 1), (m_block, n_block))
             seqlen_q_ms = (
                 seqlen.seqlen_q
                 if const_expr(not self.pack_gqa)
                 else seqlen.seqlen_q * self.qhead_per_kvhead
             )
             if thread_idx_ms < seqlen_q_ms - m_block * self.m_block_size:
-                gMC[thread_idx_ms, 0] = block_row_max
+                # Per-K-block row max: store in smem only (same scratch as final row_max; overwritten
+                # each K-block, then softmax writes running row_max before correction reads).
+                sScale[thread_idx_ms + stage * self.m_block_size + self.m_block_size * 2] = (
+                    block_row_max
+                )
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
 
         if const_expr(not is_first):
@@ -2009,6 +2007,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[LinearBlockSparseTensors] = None,
+        mMaxScore: Optional[cute.Tensor] = None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
@@ -2059,14 +2058,47 @@ class FlashAttentionForwardSm100:
                 has_work = const_expr(not self.is_split_kv) or total_block_count > Int32(0)
 
             if has_work:
+                if cutlass.const_expr(self.return_max_score and not self.pack_gqa and not self.is_varlen_q and not self.use_block_sparsity):
+                    mMax_cur_ms = mMaxScore[None, None, head_idx, batch_idx]
+                if cutlass.const_expr(self.return_max_score and not self.pack_gqa and self.is_varlen_q and not self.use_block_sparsity):
+                    mMax_cur_vl = cute.domain_offset((head_idx, seqlen.offset_q, 0), mMaxScore)
+
                 # Ignore first signal from softmax as no correction is required
                 cute.arch.mbarrier_wait(
                     mbar_ptr + self.mbar_softmax_corr_full_offset + 0, softmax_corr_consumer_phase
                 )
+                if cutlass.const_expr(self.return_max_score and not self.pack_gqa and not self.is_varlen_q and not self.use_block_sparsity):
+                    brm_s0 = sScale[tidx + 0 * self.m_block_size + self.m_block_size * 2]
+                    n_blk_first = n_block_max - 1
+                    aqm_s0 = self.q_stage * m_block + 0
+                    gMC_s0 = cute.local_tile(mMax_cur_ms, (self.m_block_size, 1), (aqm_s0, n_blk_first))
+                    if tidx < seqlen.seqlen_q - aqm_s0 * self.m_block_size:
+                        gMC_s0[tidx, 0] = brm_s0
+                if cutlass.const_expr(self.return_max_score and not self.pack_gqa and self.is_varlen_q and not self.use_block_sparsity):
+                    brm_s0 = sScale[tidx + 0 * self.m_block_size + self.m_block_size * 2]
+                    n_blk_first = n_block_max - 1
+                    aqm_s0 = self.q_stage * m_block + 0
+                    gMC_s0 = cute.local_tile(mMax_cur_vl, (1, self.m_block_size, 1), (0, aqm_s0, n_blk_first))
+                    if tidx < seqlen.seqlen_q - aqm_s0 * self.m_block_size:
+                        gMC_s0[0, tidx, 0] = brm_s0
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_empty_offset + 0)
                 cute.arch.mbarrier_wait(
                     mbar_ptr + self.mbar_softmax_corr_full_offset + 1, softmax_corr_consumer_phase
                 )
+                if cutlass.const_expr(self.return_max_score and not self.pack_gqa and not self.is_varlen_q and not self.use_block_sparsity):
+                    brm_s1 = sScale[tidx + 1 * self.m_block_size + self.m_block_size * 2]
+                    n_blk_first_s1 = n_block_max - 1
+                    aqm_s1 = self.q_stage * m_block + 1
+                    gMC_s1 = cute.local_tile(mMax_cur_ms, (self.m_block_size, 1), (aqm_s1, n_blk_first_s1))
+                    if tidx < seqlen.seqlen_q - aqm_s1 * self.m_block_size:
+                        gMC_s1[tidx, 0] = brm_s1
+                if cutlass.const_expr(self.return_max_score and not self.pack_gqa and self.is_varlen_q and not self.use_block_sparsity):
+                    brm_s1 = sScale[tidx + 1 * self.m_block_size + self.m_block_size * 2]
+                    n_blk_first_s1 = n_block_max - 1
+                    aqm_s1 = self.q_stage * m_block + 1
+                    gMC_s1 = cute.local_tile(mMax_cur_vl, (1, self.m_block_size, 1), (0, aqm_s1, n_blk_first_s1))
+                    if tidx < seqlen.seqlen_q - aqm_s1 * self.m_block_size:
+                        gMC_s1[0, tidx, 0] = brm_s1
                 softmax_corr_consumer_phase ^= 1
 
                 tSrScale_t2r = cute.make_fragment(tSrScale_t2r_shape, Float32)
@@ -2077,16 +2109,22 @@ class FlashAttentionForwardSm100:
                             mbar_ptr + self.mbar_softmax_corr_full_offset + stage,
                             softmax_corr_consumer_phase,
                         )
-                        # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
-                        # cute.arch.fence_view_async_tmem_load()
-                        # scale = tSrScale_t2r[0]
                         scale = sScale[tidx + stage * self.m_block_size]
+                        if cutlass.const_expr(self.return_max_score and not self.pack_gqa and not self.is_varlen_q and not self.use_block_sparsity):
+                            brm = sScale[tidx + stage * self.m_block_size + self.m_block_size * 2]
+                            n_blk_cur = n_block_max - 2 - i
+                            aqm = self.q_stage * m_block + stage
+                            gMC = cute.local_tile(mMax_cur_ms, (self.m_block_size, 1), (aqm, n_blk_cur))
+                            if tidx < seqlen.seqlen_q - aqm * self.m_block_size:
+                                gMC[tidx, 0] = brm
+                        if cutlass.const_expr(self.return_max_score and not self.pack_gqa and self.is_varlen_q and not self.use_block_sparsity):
+                            brm = sScale[tidx + stage * self.m_block_size + self.m_block_size * 2]
+                            n_blk_cur = n_block_max - 2 - i
+                            aqm = self.q_stage * m_block + stage
+                            gMC = cute.local_tile(mMax_cur_vl, (1, self.m_block_size, 1), (0, aqm, n_blk_cur))
+                            if tidx < seqlen.seqlen_q - aqm * self.m_block_size:
+                                gMC[0, tidx, 0] = brm
                         should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
-                        # should_rescale = True
-                        # if tidx == 0: cute.printf("Correction scale i = %d, for stage %d: %f, should_rescale = %d\n", i, stage, scale, should_rescale)
-                        # Don't need O_full anymore, since by the time softmax has signaled the correction
-                        # warps, S_i must have been done, so O_i-1 must have been done as well.
-                        # cute.arch.mbarrier_wait(mbar_ptr + self.mbar_O_full_offset + stage, o_corr_consumer_phase)
                         if should_rescale:
                             self.correction_rescale(
                                 thr_mma_pv, tOtOs[stage if self.q_stage == 2 else 0], tidx, scale
@@ -2096,7 +2134,6 @@ class FlashAttentionForwardSm100:
                             mbar_ptr + self.mbar_softmax_corr_empty_offset + (1 - stage)
                         )
                     softmax_corr_consumer_phase ^= 1
-                    # o_corr_consumer_phase ^= 1
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_empty_offset + 1)
                 # End of seqlen_corr_loop_steps
 
