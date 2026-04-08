@@ -263,6 +263,41 @@ def compute_reference_block_max_scores(tensors, arbitrary_func=None):
     return qk_chunks.amax(dim=-1).contiguous()
 
 
+def compute_reference_block_lse(tensors, softmax_scale, arbitrary_func=None):
+    """Per (batch, head, q_pos), scaled LSE per K-tile of 128.
+
+    Computes ``log(sum(exp(QK * softmax_scale)))`` per K block, matching the kernel's
+    ``block_lse_out``.  Uses BF16 QK GEMM accumulated in FP32.
+    """
+    q = tensors["q"]
+    k = tensors["k"]
+    batch_size = q.shape[0]
+    seqlen_q = q.shape[1]
+    seqlen_k = k.shape[1]
+    nheads = q.shape[2]
+    nheads_kv = k.shape[2]
+
+    if nheads_kv == nheads:
+        qk_attn = torch.einsum("bnhd,bmhd->bhnm", q, k).to(torch.float32)
+    else:
+        k_exp = repeat(k, "b s h d -> b s (h g) d", g=nheads // nheads_kv)
+        qk_attn = torch.einsum("bnhd,bmhd->bhnm", q, k_exp).to(torch.float32)
+
+    if arbitrary_func is not None:
+        qk_attn = apply_arbitrary_mask_to_qk(
+            qk_attn, arbitrary_func, seqlen_q, seqlen_k
+        )
+
+    qk_attn = qk_attn * softmax_scale
+
+    pad = (128 - (seqlen_k % 128)) % 128
+    if pad:
+        qk_attn = F.pad(qk_attn, (0, pad), value=float("-inf"))
+    num_chunks = qk_attn.shape[-1] // 128
+    qk_chunks = qk_attn.view(batch_size, nheads, seqlen_q, num_chunks, 128)
+    return torch.logsumexp(qk_chunks, dim=-1).contiguous()
+
+
 def apply_block_sparse_unvisited_to_max_score(
     ref_dense: torch.Tensor,
     linear_k: LinearBlockSparseTensorsTorch,
@@ -613,17 +648,10 @@ def _run_mask_test(
     assert (dq - dq_ref_fp32).abs().max().item() <= 5 * (dq_ref - dq_ref_fp32).abs().max().item()
 
 
-def test_arbitrary_mask_block_score():
-    """``max_score_out`` vs BF16 QK block-max reference (dense bidirectional, SM100 only).
-
-    Dense forward only (no ``block_sparse_tensors``); see ``test_arbitrary_mask_block_score_sparse``
-    for block-sparse + ``max_score_out``. If ``import flash_attn_cute`` resolves to an older
-    ``dist-packages`` build without
-    ``return_max_score``, use editable install from ``flash_attn/cute`` or prepend a
-    ``PYTHONPATH`` that points a ``flash_attn_cute`` package dir at the repo ``cute`` sources.
-    """
+def test_arbitrary_mask_block_score_and_lse():
+    """``max_score_out`` + ``block_lse_out`` simultaneously (dense bidirectional, SM100 only)."""
     if COMPUTE_CAPABILITY != 10:
-        pytest.skip("max_score_out is only implemented on SM 10.x cute forward")
+        pytest.skip("max_score_out / block_lse_out is only implemented on SM 10.x cute forward")
 
     seqlen_q, seqlen_k = 256, 256
     nheads = 4
@@ -640,6 +668,11 @@ def test_arbitrary_mask_block_score():
 
     num_k_chunks = (seqlen_k + 127) // 128
     max_score_out = torch.empty(
+        batch_size, nheads, seqlen_q, num_k_chunks,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    block_lse_out = torch.empty(
         batch_size, nheads, seqlen_q, num_k_chunks,
         dtype=torch.float32,
         device="cuda",
@@ -662,34 +695,36 @@ def test_arbitrary_mask_block_score():
         block_sparse_tensors=None,
         aux_tensors=None,
         max_score_out=max_score_out,
+        block_lse_out=block_lse_out,
         k_sparse_block_size=128,
     )
 
-    ref_max = compute_reference_block_max_scores(tensors, arbitrary_func=None)
     assert out.shape == tensors["out"].shape
     assert torch.isfinite(out).all()
-    assert torch.isfinite(max_score_out).all()
 
-    diff = (max_score_out - ref_max).abs()
+    ref_max = compute_reference_block_max_scores(tensors, arbitrary_func=None)
+    assert torch.isfinite(max_score_out).all()
+    diff_ms = (max_score_out - ref_max).abs()
+    print(f"max_score_out diff max: {diff_ms.max().item()}, avg: {diff_ms.mean().item()}")
     assert torch.allclose(
-        max_score_out,
-        ref_max,
-        rtol=0.06,
-        atol=0.2,
-    ), f"max_score mismatch max diff {diff.max().item()}"
+        max_score_out, ref_max, rtol=0.06, atol=0.2,
+    ), f"max_score mismatch max diff {diff_ms.max().item()}"
+
+    ref_lse = compute_reference_block_lse(tensors, softmax_scale, arbitrary_func=None)
+    assert torch.isfinite(block_lse_out).all()
+    diff_lse = (block_lse_out - ref_lse).abs()
+    print(f"block_lse_out diff max: {diff_lse.max().item()}, avg: {diff_lse.mean().item()}")
+    assert torch.allclose(
+        block_lse_out, ref_lse, rtol=0.06, atol=0.2,
+    ), f"block_lse mismatch max diff {diff_lse.max().item()}"
 
     _ = lse
 
 
-def test_arbitrary_mask_block_score_sparse():
-    """``max_score_out`` with linear K block sparsity + arbitrary mask (SM100).
-
-    Reference: dense BF16 QK block maxima with ``apply_arbitrary_mask_to_qk``, then ``-inf`` for
-    K-chunks not listed in ``linear_k`` for each Q super-block (``2 * tile_m`` = 256 when
-    ``tile_m == 128`` on SM100), matching ``create_block_mask`` / forward Q2K CSR layout.
-    """
+def test_arbitrary_mask_block_score_and_lse_sparse():
+    """``max_score_out`` + ``block_lse_out`` with block sparsity + arbitrary mask (SM100)."""
     if COMPUTE_CAPABILITY != 10:
-        pytest.skip("max_score_out block-sparse path is only exercised on SM 10.x")
+        pytest.skip("max_score_out / block_lse_out block-sparse path is only exercised on SM 10.x")
 
     torch.manual_seed(0)
 
@@ -737,10 +772,12 @@ def test_arbitrary_mask_block_score_sparse():
 
     num_k_chunks = (seqlen_k + 127) // 128
     max_score_out = torch.empty(
-        batch_size,
-        nheads,
-        seqlen_q,
-        num_k_chunks,
+        batch_size, nheads, seqlen_q, num_k_chunks,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    block_lse_out = torch.empty(
+        batch_size, nheads, seqlen_q, num_k_chunks,
         dtype=torch.float32,
         device="cuda",
     )
@@ -762,26 +799,41 @@ def test_arbitrary_mask_block_score_sparse():
         block_sparse_tensors=linear_k,
         aux_tensors=[arbitrary_func],
         max_score_out=max_score_out,
+        block_lse_out=block_lse_out,
         k_sparse_block_size=128,
-    )
-
-    ref_dense = compute_reference_block_max_scores(tensors, arbitrary_func)
-    ref = apply_block_sparse_unvisited_to_max_score(
-        ref_dense, linear_k, seqlen_q, sparse_tile_m
     )
 
     assert out.shape == tensors["out"].shape
     assert torch.isfinite(out).all()
 
-    diff = (max_score_out - ref).abs()
+    # --- max_score check ---
+    ref_max_dense = compute_reference_block_max_scores(tensors, arbitrary_func)
+    ref_max = apply_block_sparse_unvisited_to_max_score(
+        ref_max_dense, linear_k, seqlen_q, sparse_tile_m
+    )
+    diff_ms = (max_score_out - ref_max).abs()
+    print(f"max_score_out sparse diff max: {diff_ms.max().item()}, avg: {diff_ms.mean().item()}")
     assert torch.allclose(
-        max_score_out,
-        ref,
-        rtol=0.06,
-        atol=0.001,
-    ), f"sparse max_score mismatch max diff {diff.max().item()}"
+        max_score_out, ref_max, rtol=0.06, atol=0.001,
+    ), f"sparse max_score mismatch max diff {diff_ms.max().item()}"
 
-    print(f"max_score_out: {max_score_out} ref: {ref} diff max: {diff.max().item()} diff avg: {diff.mean().item()}")
+    # --- block_lse check ---
+    ref_lse_dense = compute_reference_block_lse(tensors, softmax_scale, arbitrary_func)
+    ref_lse = apply_block_sparse_unvisited_to_max_score(
+        ref_lse_dense, linear_k, seqlen_q, sparse_tile_m
+    )
+    diff_lse = (block_lse_out - ref_lse).abs()
+    finite_mask = torch.isfinite(ref_lse)
+    diff_finite = diff_lse[finite_mask]
+    print(f"block_lse_out sparse diff max: {diff_finite.max().item()}, avg: {diff_finite.mean().item()}")
+    assert torch.allclose(
+        block_lse_out[finite_mask], ref_lse[finite_mask], rtol=0.06, atol=0.2,
+    ), f"sparse block_lse mismatch max diff {diff_finite.max().item()}"
+    print("block score: ", max_score_out)
+    print("ref_max: ", ref_max)
+
+    print("block_lse_out: ", block_lse_out)
+    print("ref_lse: ", ref_lse)
     _ = lse
 
 

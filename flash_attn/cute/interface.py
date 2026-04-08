@@ -104,6 +104,7 @@ def _flash_attn_fwd(
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
     max_score_out: Optional[torch.Tensor] = None,
+    block_lse_out: Optional[torch.Tensor] = None,
     k_sparse_block_size: int = 128,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
@@ -122,6 +123,9 @@ def _flash_attn_fwd(
             written (callers may still pass a correctly shaped buffer for API/compile consistency).
             Shape: ``(batch, num_head, seqlen_q, ceil(seqlen_k / k_sparse_block_size))`` for fixed-length,
             or ``(num_head, total_q, num_chunks)`` when ``cu_seqlens_q`` is set. Dtype float32.
+        block_lse_out: If not ``None`` (SM100 only), outputs per-K-block scaled LSE values
+            ``log(sum(exp(S * softmax_scale)))`` for each K block. Same shape and dtype as
+            ``max_score_out``. Useful for recomputing attention output / LSE when removing blocks.
         k_sparse_block_size: K-axis chunk size for max score reduction; must equal ``n_block_size`` (128).
     """
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
@@ -268,6 +272,14 @@ def _flash_attn_fwd(
             f"k_sparse_block_size ({k_sparse_block_size}) must equal n_block_size ({n_block_size}) "
             "for max_score_out"
         )
+    if block_lse_out is not None:
+        assert compute_capability == 10, (
+            "block_lse_out is only supported on SM 10.x (Blackwell / FA4 cute path)"
+        )
+        assert k_sparse_block_size == n_block_size, (
+            f"k_sparse_block_size ({k_sparse_block_size}) must equal n_block_size ({n_block_size}) "
+            "for block_lse_out"
+        )
 
     use_block_sparsity = block_sparse_tensors is not None
     if use_block_sparsity:
@@ -335,6 +347,8 @@ def _flash_attn_fwd(
         lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
     if max_score_out is not None:
         assert not is_split_kv, "max_score_out is not supported with split KV"
+    if block_lse_out is not None:
+        assert not is_split_kv, "block_lse_out is not supported with split KV"
 
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
@@ -395,6 +409,21 @@ def _flash_attn_fwd(
         assert max_score_out.is_cuda, "max_score_out must be a CUDA tensor"
         max_score_out.fill_(float("-inf"))
 
+    if block_lse_out is not None:
+        assert page_table is None, "block_lse_out is not supported with paged KV"
+        num_k_chunks_bl = (seqlen_k + k_sparse_block_size - 1) // k_sparse_block_size
+        if cu_seqlens_q is None:
+            expected_bl = (batch_size, num_head, seqlen_q, num_k_chunks_bl)
+        else:
+            expected_bl = (num_head, total_q, num_k_chunks_bl)
+        assert block_lse_out.shape == expected_bl, (
+            f"block_lse_out shape {block_lse_out.shape} != expected {expected_bl}"
+        )
+        assert block_lse_out.dtype == torch.float32, "block_lse_out must be float32"
+        assert block_lse_out.device == device, "block_lse_out must be on the same device as q"
+        assert block_lse_out.is_cuda, "block_lse_out must be a CUDA tensor"
+        block_lse_out.fill_(float("-inf"))
+
     compile_key = (
         dtype,
         head_dim,
@@ -424,6 +453,7 @@ def _flash_attn_fwd(
         compute_capability,
         page_size not in [None, 128],  # paged KV non-TMA
         max_score_out is not None,
+        block_lse_out is not None,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         # Only create from_dlpack tensors when compilation is needed
@@ -480,6 +510,12 @@ def _flash_attn_fwd(
             else None
         )
 
+        block_lse_tensor = (
+            from_dlpack(block_lse_out.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=block_lse_out.ndim - 1)
+            if block_lse_out is not None
+            else None
+        )
+
         if compute_capability == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
             assert not is_split_kv, "SplitKV not supported on SM 9.0"
@@ -531,6 +567,7 @@ def _flash_attn_fwd(
                 is_varlen_q=cu_seqlens_q is not None
                     or seqused_q is not None,
                 return_max_score=max_score_out is not None,
+                return_block_lse=block_lse_out is not None,
             )
         else:
             raise ValueError(
@@ -567,6 +604,7 @@ def _flash_attn_fwd(
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 *_fwd_compile_args,
                 max_score_tensor,
+                block_lse_tensor,
                 options="--enable-tvm-ffi",
             )
             # ref doc: https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/compile_with_tvm_ffi.html
@@ -594,7 +632,7 @@ def _flash_attn_fwd(
         if compute_capability == 9:
             _flash_attn_fwd.compile_cache[compile_key](*_fwd_exec_args)
         else:
-            _flash_attn_fwd.compile_cache[compile_key](*_fwd_exec_args, max_score_out)
+            _flash_attn_fwd.compile_cache[compile_key](*_fwd_exec_args, max_score_out, block_lse_out)
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,
