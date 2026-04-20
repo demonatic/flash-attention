@@ -810,7 +810,9 @@ class FlashAttentionBackwardSm100:
 
         if warp_idx == 1:
             cute.arch.mbarrier_init(
-                tmem_dealloc_mbar_ptr, cute.arch.WARP_SIZE * len(self.compute_warp_ids)
+                tmem_dealloc_mbar_ptr,
+                cute.arch.WARP_SIZE
+                * (len(self.compute_warp_ids) + len(self.reduce_warp_ids)),
             )
         if const_expr(self.cluster_reduce_dQ):
             if warp_idx == 4:
@@ -1181,6 +1183,7 @@ class FlashAttentionBackwardSm100:
                 blocksparse_tensors,
                 mdQ_semaphore,
             )
+            cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr)
 
         return
 
