@@ -300,10 +300,10 @@ class PipelineTmaUmma(PipelineTmaUmmaOg):
         producer = (producer_type, producer_group)
         consumer = (consumer_type, consumer_group)
 
-        sync_object_full = PipelineAsync._make_sync_object(
+        sync_object_full = PipelineTmaUmmaOg._make_sync_object(
             barrier_storage.align(min_align=8), num_stages, producer, tx_count
         )
-        sync_object_empty = PipelineAsync._make_sync_object(
+        sync_object_empty = PipelineTmaUmmaOg._make_sync_object(
             barrier_storage.align(min_align=8) + num_stages, num_stages, consumer
         )
 
