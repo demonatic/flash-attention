@@ -124,6 +124,7 @@ class FlashAttentionForwardSm100:
         self.use_correction_warps_for_epi = is_varlen_q
         self.return_max_score = return_max_score
         self.return_block_lse = return_block_lse
+        self.per_doc_block_scoring = return_max_score or return_block_lse
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_split_kv = is_split_kv
         self.pack_gqa = pack_gqa
@@ -1693,6 +1694,30 @@ class FlashAttentionForwardSm100:
             )
             softmax.reset()
 
+            if const_expr(self.per_doc_block_scoring):
+                m_block_adj = self.q_stage * m_block + stage
+                q_row_global = m_block_adj * self.m_block_size + tidx
+                if const_expr(self.func_num >= 3):
+                    pd_doc_k_start = aux_tensors[0][batch_idx, 0, 1, q_row_global]
+                else:
+                    pd_doc_k_start = Int32(0)
+                pd_split_col = pd_doc_k_start % self.n_block_size
+                pd_acc_max = cute.make_fragment((1,), Float32)
+                pd_acc_max[0] = -Float32.inf
+                pd_acc_lse_max = cute.make_fragment((1,), Float32)
+                pd_acc_lse_max[0] = -Float32.inf
+                pd_acc_lse_sum = cute.make_fragment((1,), Float32)
+                pd_acc_lse_sum[0] = Float32(0.0)
+                pd_write_idx = cute.make_fragment((1,), Int32)
+                pd_doc_k_offset = pd_doc_k_start // self.n_block_size
+                pd_write_idx[0] = (n_block_max - 1) - pd_doc_k_offset
+            else:
+                pd_acc_max = None
+                pd_acc_lse_max = None
+                pd_acc_lse_sum = None
+                pd_write_idx = None
+                pd_split_col = None
+
             if const_expr(self.use_block_sparsity):
                 tile_block_count = get_total_block_count(blocksparse_tensors, batch_idx, head_idx, m_block)
                 has_work = tile_block_count > Int32(0)
@@ -1723,6 +1748,11 @@ class FlashAttentionForwardSm100:
                 mMaxScore=mMaxScore,
                 mBlockLSE=mBlockLSE,
                 mCuSeqlensQ=mCuSeqlensQ,
+                pd_acc_max=pd_acc_max,
+                pd_acc_lse_max=pd_acc_lse_max,
+                pd_acc_lse_sum=pd_acc_lse_sum,
+                pd_write_idx=pd_write_idx,
+                pd_split_col=pd_split_col,
             )
 
             if has_work:
@@ -1827,6 +1857,37 @@ class FlashAttentionForwardSm100:
                             )
                             # Now that we no longer already have the 1st iteration, need mask_seqlen=True here
 
+                    # Finalize last accumulated per-doc block
+                    if const_expr(self.per_doc_block_scoring):
+                        m_block_adj_fin = self.q_stage * m_block + stage
+                        thread_idx_fin = tidx
+                        valid_q_fin = thread_idx_fin < seqlen.seqlen_q - m_block_adj_fin * self.m_block_size
+                        if pd_write_idx[0] >= 0 and valid_q_fin:
+                            if const_expr(self.return_max_score and not self.pack_gqa):
+                                if pd_acc_max[0] > -Float32.inf:
+                                    if const_expr(not self.is_varlen_q):
+                                        mMax_fin = mMaxScore[None, None, head_idx, batch_idx]
+                                        gMC_fin = cute.local_tile(mMax_fin, (self.m_block_size, 1), (m_block_adj_fin, pd_write_idx[0]))
+                                        gMC_fin[thread_idx_fin, 0] = pd_acc_max[0]
+                                    else:
+                                        mMax_fin = cute.domain_offset((head_idx, seqlen.offset_q, 0), mMaxScore)
+                                        gMC_fin = cute.local_tile(mMax_fin, (1, self.m_block_size, 1), (0, m_block_adj_fin, pd_write_idx[0]))
+                                        gMC_fin[0, thread_idx_fin, 0] = pd_acc_max[0]
+                            if const_expr(self.return_block_lse and not self.pack_gqa):
+                                final_lse = -Float32.inf
+                                if pd_acc_lse_sum[0] > 0.0:
+                                    LN2_fin = math.log(2.0)
+                                    final_lse = (pd_acc_lse_max[0] * softmax.scale_log2 + utils.log2f(pd_acc_lse_sum[0])) * LN2_fin
+                                if final_lse > -Float32.inf:
+                                    if const_expr(not self.is_varlen_q):
+                                        mBL_fin = mBlockLSE[None, None, head_idx, batch_idx]
+                                        gBL_fin = cute.local_tile(mBL_fin, (self.m_block_size, 1), (m_block_adj_fin, pd_write_idx[0]))
+                                        gBL_fin[thread_idx_fin, 0] = final_lse
+                                    else:
+                                        mBL_fin = cute.domain_offset((head_idx, seqlen.offset_q, 0), mBlockLSE)
+                                        gBL_fin = cute.local_tile(mBL_fin, (1, self.m_block_size, 1), (0, m_block_adj_fin, pd_write_idx[0]))
+                                        gBL_fin[0, thread_idx_fin, 0] = final_lse
+
                     # Dense path always writes scale / signals
                     sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
                     if const_expr(mLSE is not None or learnable_sink is not None):
@@ -1887,6 +1948,11 @@ class FlashAttentionForwardSm100:
         mMaxScore: Optional[cute.Tensor] = None,
         mBlockLSE: Optional[cute.Tensor] = None,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
+        pd_acc_max: Optional[cute.Tensor] = None,
+        pd_acc_lse_max: Optional[cute.Tensor] = None,
+        pd_acc_lse_sum: Optional[cute.Tensor] = None,
+        pd_write_idx: Optional[cute.Tensor] = None,
+        pd_split_col: Optional[Int32] = None,
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
@@ -1931,24 +1997,25 @@ class FlashAttentionForwardSm100:
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block)
         if cutlass.const_expr(self.return_max_score):
-            block_row_max = utils.fmax_reduce(tSrS_t2r.load(), None, arch=100)
+            cS_pd = cute.make_identity_tensor(self.mma_tiler_qk[:2])
+            tScS_pd = thr_mma_qk.partition_C(cS_pd)
+            tScS_t2r_pd = thr_tmem_load.partition_D(tScS_pd)
+            ncol_pd = const_expr(cute.size(tScS_t2r_pd.shape))
+            res_s_pd = cute.make_fragment(tSrS_t2r.shape, Float32)
+            res_s_pd.store(tSrS_t2r.load())
+            pd_partial_max_left = Float32(-Float32.inf)
+            pd_partial_max_right = Float32(-Float32.inf)
+            for i in cutlass.range_constexpr(ncol_pd):
+                col_pd = tScS_t2r_pd[i][1]
+                if col_pd < pd_split_col:
+                    pd_partial_max_left = utils.fmax(pd_partial_max_left, res_s_pd[i])
+                else:
+                    pd_partial_max_right = utils.fmax(pd_partial_max_right, res_s_pd[i])
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
 
         if const_expr(not is_first):
             thread_idx = thr_tmem_load.thr_idx
             sScale[thread_idx + stage * self.m_block_size] = acc_scale
-        if cutlass.const_expr(self.return_max_score and not self.pack_gqa and not self.is_varlen_q):
-            thread_idx_ms = thr_tmem_load.thr_idx
-            mMax_cur = mMaxScore[None, None, head_idx, batch_idx]
-            gMC = cute.local_tile(mMax_cur, (self.m_block_size, 1), (m_block, n_block))
-            if thread_idx_ms < seqlen.seqlen_q - m_block * self.m_block_size:
-                gMC[thread_idx_ms, 0] = block_row_max
-        if cutlass.const_expr(self.return_max_score and not self.pack_gqa and self.is_varlen_q):
-            thread_idx_ms = thr_tmem_load.thr_idx
-            mMax_cur = cute.domain_offset((head_idx, seqlen.offset_q, 0), mMaxScore)
-            gMC = cute.local_tile(mMax_cur, (1, self.m_block_size, 1), (0, m_block, n_block))
-            if thread_idx_ms < seqlen.seqlen_q - m_block * self.m_block_size:
-                gMC[0, thread_idx_ms, 0] = block_row_max
         # Notify correction wg that row_max is ready
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
 
@@ -1994,25 +2061,63 @@ class FlashAttentionForwardSm100:
             mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase
         )
         if cutlass.const_expr(self.return_block_lse):
-            block_sum = utils.fadd_reduce(tSrS_t2r.load(), None, arch=100)
-            LN2 = math.log(2.0)
-            block_lse_val = (
-                (row_max * softmax.scale_log2 + utils.log2f(block_sum)) * LN2
-                if block_sum > 0.0
-                else -Float32.inf
-            )
-        if cutlass.const_expr(self.return_block_lse and not self.pack_gqa and not self.is_varlen_q):
-            thread_idx_bl = thr_tmem_load.thr_idx
-            mBL_cur = mBlockLSE[None, None, head_idx, batch_idx]
-            gBL = cute.local_tile(mBL_cur, (self.m_block_size, 1), (m_block, n_block))
-            if thread_idx_bl < seqlen.seqlen_q - m_block * self.m_block_size:
-                gBL[thread_idx_bl, 0] = block_lse_val
-        if cutlass.const_expr(self.return_block_lse and not self.pack_gqa and self.is_varlen_q):
-            thread_idx_bl = thr_tmem_load.thr_idx
-            mBL_cur = cute.domain_offset((head_idx, seqlen.offset_q, 0), mBlockLSE)
-            gBL = cute.local_tile(mBL_cur, (1, self.m_block_size, 1), (0, m_block, n_block))
-            if thread_idx_bl < seqlen.seqlen_q - m_block * self.m_block_size:
-                gBL[0, thread_idx_bl, 0] = block_lse_val
+            cS_pd2 = cute.make_identity_tensor(self.mma_tiler_qk[:2])
+            tScS_pd2 = thr_mma_qk.partition_C(cS_pd2)
+            tScS_t2r_pd2 = thr_tmem_load.partition_D(tScS_pd2)
+            ncol_pd2 = const_expr(cute.size(tScS_t2r_pd2.shape))
+            res_exp_pd = cute.make_fragment(tSrS_t2r.shape, Float32)
+            res_exp_pd.store(tSrS_t2r.load())
+            pd_partial_sum_left = Float32(0.0)
+            pd_partial_sum_right = Float32(0.0)
+            for i in cutlass.range_constexpr(ncol_pd2):
+                col_pd2 = tScS_t2r_pd2[i][1]
+                if col_pd2 < pd_split_col:
+                    pd_partial_sum_left = pd_partial_sum_left + res_exp_pd[i]
+                else:
+                    pd_partial_sum_right = pd_partial_sum_right + res_exp_pd[i]
+        if cutlass.const_expr(self.per_doc_block_scoring and not self.pack_gqa):
+            # Combine RIGHT partial with accumulator → completed per-doc block
+            if const_expr(self.return_max_score):
+                pd_combined_max = utils.fmax(pd_acc_max[0], pd_partial_max_right)
+            if const_expr(self.return_block_lse):
+                pd_combined_lse_max = utils.fmax(pd_acc_lse_max[0], row_max)
+                pd_rescale_acc = utils.exp2f((pd_acc_lse_max[0] - pd_combined_lse_max) * softmax.scale_log2) if pd_acc_lse_max[0] > -Float32.inf else Float32(0.0)
+                pd_rescale_new = utils.exp2f((row_max - pd_combined_lse_max) * softmax.scale_log2) if row_max > -Float32.inf else Float32(0.0)
+                pd_combined_lse_sum = pd_acc_lse_sum[0] * pd_rescale_acc + pd_partial_sum_right * pd_rescale_new
+            thread_idx_pd = thr_tmem_load.thr_idx
+            valid_q_pd = thread_idx_pd < seqlen.seqlen_q - m_block * self.m_block_size
+            if pd_write_idx[0] >= 0 and valid_q_pd:
+                if const_expr(self.return_max_score):
+                    if const_expr(not self.is_varlen_q):
+                        mMax_pd = mMaxScore[None, None, head_idx, batch_idx]
+                        gMC_pd = cute.local_tile(mMax_pd, (self.m_block_size, 1), (m_block, pd_write_idx[0]))
+                        gMC_pd[thread_idx_pd, 0] = pd_combined_max
+                    else:
+                        mMax_pd = cute.domain_offset((head_idx, seqlen.offset_q, 0), mMaxScore)
+                        gMC_pd = cute.local_tile(mMax_pd, (1, self.m_block_size, 1), (0, m_block, pd_write_idx[0]))
+                        gMC_pd[0, thread_idx_pd, 0] = pd_combined_max
+                if const_expr(self.return_block_lse):
+                    LN2_pd = math.log(2.0)
+                    pd_lse_val = (
+                        (pd_combined_lse_max * softmax.scale_log2 + utils.log2f(pd_combined_lse_sum)) * LN2_pd
+                        if pd_combined_lse_sum > 0.0
+                        else -Float32.inf
+                    )
+                    if const_expr(not self.is_varlen_q):
+                        mBL_pd = mBlockLSE[None, None, head_idx, batch_idx]
+                        gBL_pd = cute.local_tile(mBL_pd, (self.m_block_size, 1), (m_block, pd_write_idx[0]))
+                        gBL_pd[thread_idx_pd, 0] = pd_lse_val
+                    else:
+                        mBL_pd = cute.domain_offset((head_idx, seqlen.offset_q, 0), mBlockLSE)
+                        gBL_pd = cute.local_tile(mBL_pd, (1, self.m_block_size, 1), (0, m_block, pd_write_idx[0]))
+                        gBL_pd[0, thread_idx_pd, 0] = pd_lse_val
+            pd_write_idx[0] -= 1
+            # LEFT starts new accumulation
+            if const_expr(self.return_max_score):
+                pd_acc_max[0] = pd_partial_max_left
+            if const_expr(self.return_block_lse):
+                pd_acc_lse_max[0] = row_max
+                pd_acc_lse_sum[0] = pd_partial_sum_left
         softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
         # acc_scale = cute.arch.exp2(acc_scale_)
         return mma_si_consumer_phase ^ 1, si_corr_producer_phase ^ 1, s0_s1_sequence_phase ^ 1

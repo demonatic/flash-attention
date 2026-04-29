@@ -394,14 +394,24 @@ def _flash_attn_fwd(
 
     if max_score_out is not None:
         assert page_table is None, "max_score_out is not supported with paged KV"
-        num_k_chunks_ms = (seqlen_k + k_sparse_block_size - 1) // k_sparse_block_size
-        if cu_seqlens_q is None:
-            expected_ms = (batch_size, num_head, seqlen_q, num_k_chunks_ms)
+        if not arbitrary:
+            num_k_chunks_ms = (seqlen_k + k_sparse_block_size - 1) // k_sparse_block_size
+            if cu_seqlens_q is None:
+                expected_ms = (batch_size, num_head, seqlen_q, num_k_chunks_ms)
+            else:
+                expected_ms = (num_head, total_q, num_k_chunks_ms)
+            assert max_score_out.shape == expected_ms, (
+                f"max_score_out shape {max_score_out.shape} != expected {expected_ms}"
+            )
         else:
-            expected_ms = (num_head, total_q, num_k_chunks_ms)
-        assert max_score_out.shape == expected_ms, (
-            f"max_score_out shape {max_score_out.shape} != expected {expected_ms}"
-        )
+            if cu_seqlens_q is None:
+                assert max_score_out.shape[:3] == (batch_size, num_head, seqlen_q), (
+                    f"max_score_out shape prefix {max_score_out.shape[:3]} != expected {(batch_size, num_head, seqlen_q)}"
+                )
+            else:
+                assert max_score_out.shape[:2] == (num_head, total_q), (
+                    f"max_score_out shape prefix {max_score_out.shape[:2]} != expected {(num_head, total_q)}"
+                )
         assert max_score_out.dtype == torch.float32, "max_score_out must be float32"
         assert max_score_out.device == device, "max_score_out must be on the same device as q"
         assert max_score_out.is_cuda, "max_score_out must be a CUDA tensor"
@@ -409,14 +419,24 @@ def _flash_attn_fwd(
 
     if block_lse_out is not None:
         assert page_table is None, "block_lse_out is not supported with paged KV"
-        num_k_chunks_bl = (seqlen_k + k_sparse_block_size - 1) // k_sparse_block_size
-        if cu_seqlens_q is None:
-            expected_bl = (batch_size, num_head, seqlen_q, num_k_chunks_bl)
+        if not arbitrary:
+            num_k_chunks_bl = (seqlen_k + k_sparse_block_size - 1) // k_sparse_block_size
+            if cu_seqlens_q is None:
+                expected_bl = (batch_size, num_head, seqlen_q, num_k_chunks_bl)
+            else:
+                expected_bl = (num_head, total_q, num_k_chunks_bl)
+            assert block_lse_out.shape == expected_bl, (
+                f"block_lse_out shape {block_lse_out.shape} != expected {expected_bl}"
+            )
         else:
-            expected_bl = (num_head, total_q, num_k_chunks_bl)
-        assert block_lse_out.shape == expected_bl, (
-            f"block_lse_out shape {block_lse_out.shape} != expected {expected_bl}"
-        )
+            if cu_seqlens_q is None:
+                assert block_lse_out.shape[:3] == (batch_size, num_head, seqlen_q), (
+                    f"block_lse_out shape prefix {block_lse_out.shape[:3]} != expected {(batch_size, num_head, seqlen_q)}"
+                )
+            else:
+                assert block_lse_out.shape[:2] == (num_head, total_q), (
+                    f"block_lse_out shape prefix {block_lse_out.shape[:2]} != expected {(num_head, total_q)}"
+                )
         assert block_lse_out.dtype == torch.float32, "block_lse_out must be float32"
         assert block_lse_out.device == device, "block_lse_out must be on the same device as q"
         assert block_lse_out.is_cuda, "block_lse_out must be a CUDA tensor"

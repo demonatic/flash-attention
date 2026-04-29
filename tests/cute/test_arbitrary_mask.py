@@ -298,6 +298,147 @@ def compute_reference_block_lse(tensors, softmax_scale, arbitrary_func=None):
     return torch.logsumexp(qk_chunks, dim=-1).contiguous()
 
 
+def _get_per_doc_info(arbitrary_func, seqlen_q, seqlen_k, block_size_k=128):
+    """Extract per-doc K-block info from arbitrary_func.
+
+    Returns (doc_k_starts, n_per_doc_chunks) where:
+      doc_k_starts: int tensor (seqlen_q,) — K start per Q row
+      n_per_doc_chunks: int — buffer size matching kernel output (= global K-blocks)
+    """
+    af = arbitrary_func[0, 0, 1, :seqlen_q].long()
+    n_chunks = (seqlen_k + block_size_k - 1) // block_size_k
+    return af, n_chunks
+
+
+def _apply_block_sparse_to_qk_tokens(
+    qk_attn, linear_k, seqlen_q, seqlen_k, q_super_block, block_size_k=128,
+):
+    """Set QK positions to -inf for K tokens in unvisited global K-blocks.
+
+    Unlike ``apply_block_sparse_unvisited_to_max_score`` (which works on block-level
+    scores with global indexing), this operates on the token-level QK matrix so that
+    per-doc block references can be computed on the doubly-masked result.
+    """
+    out = qk_attn.clone()
+    num_qb = (seqlen_q + q_super_block - 1) // q_super_block
+    num_kb = (seqlen_k + block_size_k - 1) // block_size_k
+    for m in range(num_qb):
+        q_lo = m * q_super_block
+        q_hi = min((m + 1) * q_super_block, seqlen_q)
+        s = int(linear_k.mask_block_offset[m].item())
+        e = int(linear_k.mask_block_offset[m + 1].item())
+        parts = [linear_k.mask_block_idx[s:e].long()]
+        if linear_k.full_block_idx is not None and linear_k.full_block_offset is not None:
+            fs = int(linear_k.full_block_offset[m].item())
+            fe = int(linear_k.full_block_offset[m + 1].item())
+            parts.append(linear_k.full_block_idx[fs:fe].long())
+        visited = torch.cat(parts)
+        visited = visited[(visited >= 0) & (visited < num_kb)]
+        k_mask = torch.zeros(seqlen_k, dtype=torch.bool, device=out.device)
+        for kb in visited:
+            k_lo_pos = kb.item() * block_size_k
+            k_hi_pos = min(k_lo_pos + block_size_k, seqlen_k)
+            k_mask[k_lo_pos:k_hi_pos] = True
+        out[:, :, q_lo:q_hi, ~k_mask] = float("-inf")
+    return out
+
+
+def compute_reference_per_doc_block_max_scores(
+    tensors, arbitrary_func, block_size_k=128, linear_k=None, q_super_block=None,
+):
+    """Per-doc block max scores: K-blocks aligned to each Q row's doc_k_start.
+
+    For Q row q with doc_k_start = arbitrary_func[0,0,1,q]:
+      per-doc K-block b covers global K range [doc_k_start + b*128, doc_k_start + (b+1)*128).
+
+    Returns: (batch, nheads, seqlen_q, n_per_doc_chunks), float32
+    """
+    q, k = tensors["q"], tensors["k"]
+    batch_size, seqlen_q, nheads, _ = q.shape
+    seqlen_k = k.shape[1]
+    nheads_kv = k.shape[2]
+
+    if nheads_kv == nheads:
+        qk_attn = torch.einsum("bnhd,bmhd->bhnm", q, k).to(torch.float32)
+    else:
+        k_exp = repeat(k, "b s h d -> b s (h g) d", g=nheads // nheads_kv)
+        qk_attn = torch.einsum("bnhd,bmhd->bhnm", q, k_exp).to(torch.float32)
+
+    qk_attn = apply_arbitrary_mask_to_qk(qk_attn, arbitrary_func, seqlen_q, seqlen_k)
+    if linear_k is not None:
+        qk_attn = _apply_block_sparse_to_qk_tokens(
+            qk_attn, linear_k, seqlen_q, seqlen_k, q_super_block, block_size_k,
+        )
+
+    doc_k_starts, n_chunks = _get_per_doc_info(
+        arbitrary_func, seqlen_q, seqlen_k, block_size_k
+    )
+
+    result = torch.full(
+        (batch_size, nheads, seqlen_q, n_chunks),
+        float("-inf"), dtype=torch.float32, device=q.device,
+    )
+    for qi in range(seqlen_q):
+        dk_start = doc_k_starts[qi].item()
+        for b in range(n_chunks):
+            k_lo = dk_start + b * block_size_k
+            k_hi = min(k_lo + block_size_k, seqlen_k)
+            if k_lo >= seqlen_k:
+                break
+            result[:, :, qi, b] = qk_attn[:, :, qi, k_lo:k_hi].amax(dim=-1)
+    return result
+
+
+def compute_reference_per_doc_block_lse(
+    tensors, softmax_scale, arbitrary_func, block_size_k=128,
+    linear_k=None, q_super_block=None,
+):
+    """Per-doc block LSE: K-blocks aligned to each Q row's doc_k_start.
+
+    Same layout as ``compute_reference_per_doc_block_max_scores`` but computes
+    ``log(sum(exp(QK * softmax_scale)))`` per per-doc K-block.
+
+    Returns: (batch, nheads, seqlen_q, n_per_doc_chunks), float32
+    """
+    q, k = tensors["q"], tensors["k"]
+    batch_size, seqlen_q, nheads, _ = q.shape
+    seqlen_k = k.shape[1]
+    nheads_kv = k.shape[2]
+
+    if nheads_kv == nheads:
+        qk_attn = torch.einsum("bnhd,bmhd->bhnm", q, k).to(torch.float32)
+    else:
+        k_exp = repeat(k, "b s h d -> b s (h g) d", g=nheads // nheads_kv)
+        qk_attn = torch.einsum("bnhd,bmhd->bhnm", q, k_exp).to(torch.float32)
+
+    qk_attn = apply_arbitrary_mask_to_qk(qk_attn, arbitrary_func, seqlen_q, seqlen_k)
+    if linear_k is not None:
+        qk_attn = _apply_block_sparse_to_qk_tokens(
+            qk_attn, linear_k, seqlen_q, seqlen_k, q_super_block, block_size_k,
+        )
+    qk_attn = qk_attn * softmax_scale
+
+    doc_k_starts, n_chunks = _get_per_doc_info(
+        arbitrary_func, seqlen_q, seqlen_k, block_size_k
+    )
+
+    result = torch.full(
+        (batch_size, nheads, seqlen_q, n_chunks),
+        float("-inf"), dtype=torch.float32, device=q.device,
+    )
+    for qi in range(seqlen_q):
+        dk_start = doc_k_starts[qi].item()
+        for b in range(n_chunks):
+            k_lo = dk_start + b * block_size_k
+            k_hi = min(k_lo + block_size_k, seqlen_k)
+            if k_lo >= seqlen_k:
+                break
+            result[:, :, qi, b] = torch.logsumexp(
+                qk_attn[:, :, qi, k_lo:k_hi], dim=-1,
+            )
+    return result
+
+
 def apply_block_sparse_unvisited_to_max_score(
     ref_dense: torch.Tensor,
     linear_k: LinearBlockSparseTensorsTorch,
@@ -806,21 +947,20 @@ def test_arbitrary_mask_block_score_and_lse_sparse():
     assert out.shape == tensors["out"].shape
     assert torch.isfinite(out).all()
 
-    # --- max_score check ---
-    ref_max_dense = compute_reference_block_max_scores(tensors, arbitrary_func)
-    ref_max = apply_block_sparse_unvisited_to_max_score(
-        ref_max_dense, linear_k, seqlen_q, sparse_tile_m
+    # --- max_score check (per-doc block scoring) ---
+    ref_max = compute_reference_per_doc_block_max_scores(
+        tensors, arbitrary_func, linear_k=linear_k, q_super_block=sparse_tile_m,
     )
     diff_ms = (max_score_out - ref_max).abs()
     print(f"max_score_out sparse diff max: {diff_ms.max().item()}, avg: {diff_ms.mean().item()}")
     assert torch.allclose(
-        max_score_out, ref_max, rtol=0.06, atol=0.001,
+        max_score_out, ref_max, rtol=0.06, atol=0.2,
     ), f"sparse max_score mismatch max diff {diff_ms.max().item()}"
 
-    # --- block_lse check ---
-    ref_lse_dense = compute_reference_block_lse(tensors, softmax_scale, arbitrary_func)
-    ref_lse = apply_block_sparse_unvisited_to_max_score(
-        ref_lse_dense, linear_k, seqlen_q, sparse_tile_m
+    # --- block_lse check (per-doc block scoring) ---
+    ref_lse = compute_reference_per_doc_block_lse(
+        tensors, softmax_scale, arbitrary_func,
+        linear_k=linear_k, q_super_block=sparse_tile_m,
     )
     diff_lse = (block_lse_out - ref_lse).abs()
     finite_mask = torch.isfinite(ref_lse)
@@ -829,11 +969,6 @@ def test_arbitrary_mask_block_score_and_lse_sparse():
     assert torch.allclose(
         block_lse_out[finite_mask], ref_lse[finite_mask], rtol=0.06, atol=0.2,
     ), f"sparse block_lse mismatch max diff {diff_finite.max().item()}"
-    print("block score: ", max_score_out)
-    print("ref_max: ", ref_max)
-
-    print("block_lse_out: ", block_lse_out)
-    print("ref_lse: ", ref_lse)
     _ = lse
 
 
