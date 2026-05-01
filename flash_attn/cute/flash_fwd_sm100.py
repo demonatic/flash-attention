@@ -1984,24 +1984,29 @@ class FlashAttentionForwardSm100:
             mask_fn(tSrS_t2r, n_block=n_block)
         if cutlass.const_expr(self.return_max_score):
             if cutlass.const_expr(self.per_doc_block_scoring and not self.pack_gqa):
-                cS_pd = cute.make_identity_tensor(self.mma_tiler_qk[:2])
-                tScS_pd = thr_mma_qk.partition_C(cS_pd)
-                tScS_t2r_pd = thr_tmem_load.partition_D(tScS_pd)
-                ncol_pd = const_expr(cute.size(tScS_t2r_pd.shape))
-                res_s_pd = cute.make_fragment(tSrS_t2r.shape, Float32)
-                res_s_pd.store(tSrS_t2r.load())
+                pd_tile_max = Float32(-Float32.inf)
                 pd_partial_max_left = Float32(-Float32.inf)
                 pd_partial_max_right = Float32(-Float32.inf)
-                pd_seqlen_k_col_limit = seqlen.seqlen_k - n_block * self.n_block_size
-                for i in cutlass.range_constexpr(ncol_pd):
-                    col_pd = tScS_t2r_pd[i][1]
-                    if col_pd >= pd_seqlen_k_col_limit:
-                        pass
-                    elif col_pd < pd_split_col:
-                        pd_partial_max_left = utils.fmax(pd_partial_max_left, res_s_pd[i])
-                    else:
-                        pd_partial_max_right = utils.fmax(pd_partial_max_right, res_s_pd[i])
-            pd_tile_max = utils.fmax_reduce(tSrS_t2r.load(), arch=self.arch)
+                if pd_split_col == 0:
+                    pd_tile_max = utils.fmax_reduce(tSrS_t2r.load(), arch=self.arch)
+                    pd_partial_max_right = pd_tile_max
+                else:
+                    res_s_pd = cute.make_fragment(tSrS_t2r.shape, Float32)
+                    res_s_pd.store(tSrS_t2r.load())
+                    ncol_pd = const_expr(cute.size(res_s_pd.shape))
+                    for s in cutlass.range_constexpr(cute.ceil_div(ncol_pd, 24)):
+                        split_s = min(max(pd_split_col - s * 24, 0), 24)
+                        mask_left = (1 << split_s) - 1
+                        for i in cutlass.range_constexpr(min(24, ncol_pd - s * 24)):
+                            c = s * 24 + i
+                            is_left = cutlass.Boolean(mask_left & (1 << i))
+                            if is_left:
+                                pd_partial_max_left = utils.fmax(pd_partial_max_left, res_s_pd[c])
+                            else:
+                                pd_partial_max_right = utils.fmax(pd_partial_max_right, res_s_pd[c])
+                    pd_tile_max = utils.fmax(pd_partial_max_left, pd_partial_max_right)
+            else:
+                pd_tile_max = utils.fmax_reduce(tSrS_t2r.load(), arch=self.arch)
             if const_expr(is_first):
                 row_max_new = pd_tile_max
                 row_max = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
@@ -2094,24 +2099,27 @@ class FlashAttentionForwardSm100:
                             gMC_pd2[0, thread_idx_pd, 0] = utils.fmax(gMC_pd2[0, thread_idx_pd, 0], pd_partial_max_left)
         if cutlass.const_expr(self.return_block_lse):
             if cutlass.const_expr(self.per_doc_block_scoring and not self.pack_gqa):
-                cS_pd2 = cute.make_identity_tensor(self.mma_tiler_qk[:2])
-                tScS_pd2 = thr_mma_qk.partition_C(cS_pd2)
-                tScS_t2r_pd2 = thr_tmem_load.partition_D(tScS_pd2)
-                ncol_pd2 = const_expr(cute.size(tScS_t2r_pd2.shape))
-                res_exp_pd = cute.make_fragment(tSrS_t2r.shape, Float32)
-                res_exp_pd.store(tSrS_t2r.load())
+                pd_tile_sum = Float32(0.0)
                 pd_partial_sum_left = Float32(0.0)
                 pd_partial_sum_right = Float32(0.0)
-                pd_seqlen_k_col_limit2 = seqlen.seqlen_k - n_block * self.n_block_size
-                for i in cutlass.range_constexpr(ncol_pd2):
-                    col_pd2 = tScS_t2r_pd2[i][1]
-                    if col_pd2 >= pd_seqlen_k_col_limit2:
-                        pass
-                    elif col_pd2 < pd_split_col:
-                        pd_partial_sum_left = pd_partial_sum_left + res_exp_pd[i]
-                    else:
-                        pd_partial_sum_right = pd_partial_sum_right + res_exp_pd[i]
-                pd_tile_sum = pd_partial_sum_left + pd_partial_sum_right
+                if pd_split_col == 0:
+                    pd_tile_sum = utils.fadd_reduce(tSrS_t2r.load(), arch=self.arch)
+                    pd_partial_sum_right = pd_tile_sum
+                else:
+                    res_exp_pd = cute.make_fragment(tSrS_t2r.shape, Float32)
+                    res_exp_pd.store(tSrS_t2r.load())
+                    ncol_pd2 = const_expr(cute.size(res_exp_pd.shape))
+                    for s in cutlass.range_constexpr(cute.ceil_div(ncol_pd2, 24)):
+                        split_s2 = min(max(pd_split_col - s * 24, 0), 24)
+                        mask_left2 = (1 << split_s2) - 1
+                        for i in cutlass.range_constexpr(min(24, ncol_pd2 - s * 24)):
+                            c = s * 24 + i
+                            is_left2 = cutlass.Boolean(mask_left2 & (1 << i))
+                            if is_left2:
+                                pd_partial_sum_left = pd_partial_sum_left + res_exp_pd[c]
+                            else:
+                                pd_partial_sum_right = pd_partial_sum_right + res_exp_pd[c]
+                    pd_tile_sum = pd_partial_sum_left + pd_partial_sum_right
             else:
                 pd_tile_sum = utils.fadd_reduce(tSrS_t2r.load(), arch=self.arch)
             if const_expr(is_first):
