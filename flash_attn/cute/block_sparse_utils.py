@@ -1089,6 +1089,7 @@ def softmax_block_sparse_sm100(
     mbar_P_full_2_offset: Int32,
     q_stage: cutlass.Constexpr,
     stage_idx: Int32,
+    merged_order: cutlass.Constexpr = False,
 ):
     mask_block_cnt, mask_block_offset, mask_block_idx, full_block_cnt, full_block_offset, full_block_idx = blocksparse_tensors
 
@@ -1113,37 +1114,70 @@ def softmax_block_sparse_sm100(
         cute.arch.mbarrier_arrive(mbar_ptr + mbar_P_full_2_offset + stage_idx)
         cute.arch.mbarrier_arrive(mbar_ptr + mbar_softmax_corr_empty_offset + stage_idx)
     else:
-        if curr_mask_block_cnt > 0:
-            # for arbitrary mask, we do not need this to check boundary, and two-level code structure will cause register spilling.
-            for i in cutlass.range(0, curr_mask_block_cnt):
-                mask_n_block = curr_mask_block_idx[curr_mask_block_offset + curr_mask_block_cnt - 1 - i]
-                (
-                    mma_si_consumer_phase,
-                    si_corr_producer_phase,
-                    s0_s1_sequence_phase,
-                ) = softmax_step(
-                    mma_si_consumer_phase,
-                    si_corr_producer_phase,
-                    s0_s1_sequence_phase,
-                    mask_n_block,
-                    mask_fn=partial(mask_fn, mask_seqlen=False),
-                )
+        if const_expr(merged_order and full_block_cnt is not None):
+            mask_remaining = curr_mask_block_cnt
+            full_remaining = curr_full_block_cnt
+            for i in cutlass.range(0, total_block_cnt):
+                mask_candidate = curr_mask_block_idx[curr_mask_block_offset + mask_remaining - 1] if mask_remaining > 0 else Int32(-1)
+                full_candidate = curr_full_block_idx[curr_full_block_offset + full_remaining - 1] if full_remaining > 0 else Int32(-1)
+                if mask_candidate > full_candidate:
+                    (
+                        mma_si_consumer_phase,
+                        si_corr_producer_phase,
+                        s0_s1_sequence_phase,
+                    ) = softmax_step(
+                        mma_si_consumer_phase,
+                        si_corr_producer_phase,
+                        s0_s1_sequence_phase,
+                        mask_candidate,
+                        mask_fn=partial(mask_fn, mask_seqlen=False),
+                    )
+                    mask_remaining = mask_remaining - 1
+                else:
+                    (
+                        mma_si_consumer_phase,
+                        si_corr_producer_phase,
+                        s0_s1_sequence_phase,
+                    ) = softmax_step(
+                        mma_si_consumer_phase,
+                        si_corr_producer_phase,
+                        s0_s1_sequence_phase,
+                        full_candidate,
+                        mask_fn=None,
+                    )
+                    full_remaining = full_remaining - 1
+        else:
+            if curr_mask_block_cnt > 0:
+                # for arbitrary mask, we do not need this to check boundary, and two-level code structure will cause register spilling.
+                for i in cutlass.range(0, curr_mask_block_cnt):
+                    mask_n_block = curr_mask_block_idx[curr_mask_block_offset + curr_mask_block_cnt - 1 - i]
+                    (
+                        mma_si_consumer_phase,
+                        si_corr_producer_phase,
+                        s0_s1_sequence_phase,
+                    ) = softmax_step(
+                        mma_si_consumer_phase,
+                        si_corr_producer_phase,
+                        s0_s1_sequence_phase,
+                        mask_n_block,
+                        mask_fn=partial(mask_fn, mask_seqlen=False),
+                    )
 
-        if curr_full_block_cnt > 0:
-            # for arbitrary mask, we do not need this to check boundary, and two-level code structure will cause register spilling.
-            for i in cutlass.range(0, curr_full_block_cnt):
-                full_n_block = curr_full_block_idx[curr_full_block_offset + curr_full_block_cnt - 1 - i]
-                (
-                    mma_si_consumer_phase,
-                    si_corr_producer_phase,
-                    s0_s1_sequence_phase,
-                ) = softmax_step(
-                    mma_si_consumer_phase,
-                    si_corr_producer_phase,
-                    s0_s1_sequence_phase,
-                    full_n_block,
-                    mask_fn=None,
-                )
+            if curr_full_block_cnt > 0:
+                # for arbitrary mask, we do not need this to check boundary, and two-level code structure will cause register spilling.
+                for i in cutlass.range(0, curr_full_block_cnt):
+                    full_n_block = curr_full_block_idx[curr_full_block_offset + curr_full_block_cnt - 1 - i]
+                    (
+                        mma_si_consumer_phase,
+                        si_corr_producer_phase,
+                        s0_s1_sequence_phase,
+                    ) = softmax_step(
+                        mma_si_consumer_phase,
+                        si_corr_producer_phase,
+                        s0_s1_sequence_phase,
+                        full_n_block,
+                        mask_fn=None,
+                    )
 
     return (
         mma_si_consumer_phase,
