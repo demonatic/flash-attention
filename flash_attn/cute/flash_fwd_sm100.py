@@ -2069,8 +2069,9 @@ class FlashAttentionForwardSm100:
         cute.arch.fence_view_async_tmem_store()
         # Notify mma warp that the 2nd half of P is ready
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
-        # Block scoring writes and row_sum update run before correction wait
-        # to overlap with the correction warp's O-rescaling work.
+        cute.arch.mbarrier_wait(
+            mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase
+        )
         if cutlass.const_expr(self.per_doc_block_scoring and not self.pack_gqa):
             pd_right_doc_block = n_block - pd_doc_k_start_tile
             pd_left_doc_block = pd_right_doc_block - 1
@@ -2198,9 +2199,6 @@ class FlashAttentionForwardSm100:
                                 gBL_pd2[0, thread_idx_pd, 0] = pd_lse_left
         else:
             softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
-        cute.arch.mbarrier_wait(
-            mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase
-        )
         # acc_scale = cute.arch.exp2(acc_scale_)
         return mma_si_consumer_phase ^ 1, si_corr_producer_phase ^ 1, s0_s1_sequence_phase ^ 1
 
