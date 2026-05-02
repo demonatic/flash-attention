@@ -21,7 +21,7 @@ import torch
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 import torch.nn.functional as F
 
-from flash_attn.cute.interface import flash_attn_func
+from flash_attn.cute.interface import flash_attn_func, _flash_attn_fwd
 from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch, bhqk_to_linear_sparse_tensors, LinearBlockSparseTensorsTorch
 
 # Import CUDA kernel for create_block_mask
@@ -226,6 +226,257 @@ def compute_reference_arbitrary(tensors, arbitrary_func, up_cast=False):
     if is_all_zero:
         out[:] = 0.0
 
+    return out
+
+
+def compute_reference_block_max_scores(tensors, arbitrary_func=None):
+    """Per (batch, head, q_pos), max of QK (optionally arbitrary-masked) per K-tile of 128.
+
+    Matches SM100 ``max_score_out``: raw QK^T **before** ``1/sqrt(d)`` softmax scale, BF16
+    GEMM accumulated in FP32; optional ``apply_arbitrary_mask_to_qk`` when ``arbitrary_func``
+    is set (note: may diverge from kernel for dense arbitrary; use ``None`` for strict checks).
+    """
+    q = tensors["q"]
+    k = tensors["k"]
+    batch_size = q.shape[0]
+    seqlen_q = q.shape[1]
+    seqlen_k = k.shape[1]
+    nheads = q.shape[2]
+    nheads_kv = k.shape[2]
+
+    if nheads_kv == nheads:
+        qk_attn = torch.einsum("bnhd,bmhd->bhnm", q, k).to(torch.float32)
+    else:
+        k_exp = repeat(k, "b s h d -> b s (h g) d", g=nheads // nheads_kv)
+        qk_attn = torch.einsum("bnhd,bmhd->bhnm", q, k_exp).to(torch.float32)
+
+    if arbitrary_func is not None:
+        qk_attn = apply_arbitrary_mask_to_qk(
+            qk_attn, arbitrary_func, seqlen_q, seqlen_k
+        )
+
+    pad = (128 - (seqlen_k % 128)) % 128
+    if pad:
+        qk_attn = F.pad(qk_attn, (0, pad), value=float("-inf"))
+    num_chunks = qk_attn.shape[-1] // 128
+    qk_chunks = qk_attn.view(batch_size, nheads, seqlen_q, num_chunks, 128)
+    return qk_chunks.amax(dim=-1).contiguous()
+
+
+def compute_reference_block_lse(tensors, softmax_scale, arbitrary_func=None):
+    """Per (batch, head, q_pos), scaled LSE per K-tile of 128.
+
+    Computes ``log(sum(exp(QK * softmax_scale)))`` per K block, matching the kernel's
+    ``block_lse_out``.  Uses BF16 QK GEMM accumulated in FP32.
+    """
+    q = tensors["q"]
+    k = tensors["k"]
+    batch_size = q.shape[0]
+    seqlen_q = q.shape[1]
+    seqlen_k = k.shape[1]
+    nheads = q.shape[2]
+    nheads_kv = k.shape[2]
+
+    if nheads_kv == nheads:
+        qk_attn = torch.einsum("bnhd,bmhd->bhnm", q, k).to(torch.float32)
+    else:
+        k_exp = repeat(k, "b s h d -> b s (h g) d", g=nheads // nheads_kv)
+        qk_attn = torch.einsum("bnhd,bmhd->bhnm", q, k_exp).to(torch.float32)
+
+    if arbitrary_func is not None:
+        qk_attn = apply_arbitrary_mask_to_qk(
+            qk_attn, arbitrary_func, seqlen_q, seqlen_k
+        )
+
+    qk_attn = qk_attn * softmax_scale
+
+    pad = (128 - (seqlen_k % 128)) % 128
+    if pad:
+        qk_attn = F.pad(qk_attn, (0, pad), value=float("-inf"))
+    num_chunks = qk_attn.shape[-1] // 128
+    qk_chunks = qk_attn.view(batch_size, nheads, seqlen_q, num_chunks, 128)
+    return torch.logsumexp(qk_chunks, dim=-1).contiguous()
+
+
+def _get_per_doc_info(arbitrary_func, seqlen_q, seqlen_k, block_size_k=128, max_seqlen_k=None):
+    """Extract per-doc K-block info from arbitrary_func.
+
+    Returns (doc_k_starts, n_per_doc_chunks) where:
+      doc_k_starts: int tensor (seqlen_q,) — K start per Q row
+      n_per_doc_chunks: int — buffer size matching kernel output
+    """
+    func_num = arbitrary_func.shape[2]
+    if func_num >= 3:
+        af = arbitrary_func[0, 0, 1, :seqlen_q].long()
+    else:
+        af = torch.zeros(seqlen_q, dtype=torch.long, device=arbitrary_func.device)
+    eff_k = max_seqlen_k if max_seqlen_k is not None else seqlen_k
+    n_chunks = (eff_k + block_size_k - 1) // block_size_k
+    return af, n_chunks
+
+
+def _apply_block_sparse_to_qk_tokens(
+    qk_attn, linear_k, seqlen_q, seqlen_k, q_super_block, block_size_k=128,
+):
+    """Set QK positions to -inf for K tokens in unvisited global K-blocks.
+
+    Unlike ``apply_block_sparse_unvisited_to_max_score`` (which works on block-level
+    scores with global indexing), this operates on the token-level QK matrix so that
+    per-doc block references can be computed on the doubly-masked result.
+    """
+    out = qk_attn.clone()
+    num_qb = (seqlen_q + q_super_block - 1) // q_super_block
+    num_kb = (seqlen_k + block_size_k - 1) // block_size_k
+    for m in range(num_qb):
+        q_lo = m * q_super_block
+        q_hi = min((m + 1) * q_super_block, seqlen_q)
+        s = int(linear_k.mask_block_offset[m].item())
+        e = int(linear_k.mask_block_offset[m + 1].item())
+        parts = [linear_k.mask_block_idx[s:e].long()]
+        if linear_k.full_block_idx is not None and linear_k.full_block_offset is not None:
+            fs = int(linear_k.full_block_offset[m].item())
+            fe = int(linear_k.full_block_offset[m + 1].item())
+            parts.append(linear_k.full_block_idx[fs:fe].long())
+        visited = torch.cat(parts)
+        visited = visited[(visited >= 0) & (visited < num_kb)]
+        k_mask = torch.zeros(seqlen_k, dtype=torch.bool, device=out.device)
+        for kb in visited:
+            k_lo_pos = kb.item() * block_size_k
+            k_hi_pos = min(k_lo_pos + block_size_k, seqlen_k)
+            k_mask[k_lo_pos:k_hi_pos] = True
+        out[:, :, q_lo:q_hi, ~k_mask] = float("-inf")
+    return out
+
+
+def compute_reference_per_doc_block_max_scores(
+    tensors, arbitrary_func, block_size_k=128, linear_k=None, q_super_block=None,
+    max_seqlen_k=None,
+):
+    """Per-doc block max scores: K-blocks aligned to each Q row's doc_k_start.
+
+    For Q row q with doc_k_start = arbitrary_func[0,0,1,q]:
+      per-doc K-block b covers global K range [doc_k_start + b*128, doc_k_start + (b+1)*128).
+
+    Returns: (batch, nheads, seqlen_q, n_per_doc_chunks), float32
+    """
+    q, k = tensors["q"], tensors["k"]
+    batch_size, seqlen_q, nheads, _ = q.shape
+    seqlen_k = k.shape[1]
+    nheads_kv = k.shape[2]
+
+    if nheads_kv == nheads:
+        qk_attn = torch.einsum("bnhd,bmhd->bhnm", q, k).to(torch.float32)
+    else:
+        k_exp = repeat(k, "b s h d -> b s (h g) d", g=nheads // nheads_kv)
+        qk_attn = torch.einsum("bnhd,bmhd->bhnm", q, k_exp).to(torch.float32)
+
+    qk_attn = apply_arbitrary_mask_to_qk(qk_attn, arbitrary_func, seqlen_q, seqlen_k)
+    if linear_k is not None:
+        qk_attn = _apply_block_sparse_to_qk_tokens(
+            qk_attn, linear_k, seqlen_q, seqlen_k, q_super_block, block_size_k,
+        )
+
+    doc_k_starts, n_chunks = _get_per_doc_info(
+        arbitrary_func, seqlen_q, seqlen_k, block_size_k, max_seqlen_k=max_seqlen_k
+    )
+
+    result = torch.full(
+        (batch_size, nheads, seqlen_q, n_chunks),
+        float("-inf"), dtype=torch.float32, device=q.device,
+    )
+    for qi in range(seqlen_q):
+        dk_start = doc_k_starts[qi].item()
+        for b in range(n_chunks):
+            k_lo = dk_start + b * block_size_k
+            k_hi = min(k_lo + block_size_k, seqlen_k)
+            if k_lo >= seqlen_k:
+                break
+            result[:, :, qi, b] = qk_attn[:, :, qi, k_lo:k_hi].amax(dim=-1)
+    return result
+
+
+def compute_reference_per_doc_block_lse(
+    tensors, softmax_scale, arbitrary_func, block_size_k=128,
+    linear_k=None, q_super_block=None, max_seqlen_k=None,
+):
+    """Per-doc block LSE: K-blocks aligned to each Q row's doc_k_start.
+
+    Same layout as ``compute_reference_per_doc_block_max_scores`` but computes
+    ``log(sum(exp(QK * softmax_scale)))`` per per-doc K-block.
+
+    Returns: (batch, nheads, seqlen_q, n_per_doc_chunks), float32
+    """
+    q, k = tensors["q"], tensors["k"]
+    batch_size, seqlen_q, nheads, _ = q.shape
+    seqlen_k = k.shape[1]
+    nheads_kv = k.shape[2]
+
+    if nheads_kv == nheads:
+        qk_attn = torch.einsum("bnhd,bmhd->bhnm", q, k).to(torch.float32)
+    else:
+        k_exp = repeat(k, "b s h d -> b s (h g) d", g=nheads // nheads_kv)
+        qk_attn = torch.einsum("bnhd,bmhd->bhnm", q, k_exp).to(torch.float32)
+
+    qk_attn = apply_arbitrary_mask_to_qk(qk_attn, arbitrary_func, seqlen_q, seqlen_k)
+    if linear_k is not None:
+        qk_attn = _apply_block_sparse_to_qk_tokens(
+            qk_attn, linear_k, seqlen_q, seqlen_k, q_super_block, block_size_k,
+        )
+    qk_attn = qk_attn * softmax_scale
+
+    doc_k_starts, n_chunks = _get_per_doc_info(
+        arbitrary_func, seqlen_q, seqlen_k, block_size_k, max_seqlen_k=max_seqlen_k
+    )
+
+    result = torch.full(
+        (batch_size, nheads, seqlen_q, n_chunks),
+        float("-inf"), dtype=torch.float32, device=q.device,
+    )
+    for qi in range(seqlen_q):
+        dk_start = doc_k_starts[qi].item()
+        for b in range(n_chunks):
+            k_lo = dk_start + b * block_size_k
+            k_hi = min(k_lo + block_size_k, seqlen_k)
+            if k_lo >= seqlen_k:
+                break
+            result[:, :, qi, b] = torch.logsumexp(
+                qk_attn[:, :, qi, k_lo:k_hi], dim=-1,
+            )
+    return result
+
+
+def apply_block_sparse_unvisited_to_max_score(
+    ref_dense: torch.Tensor,
+    linear_k: LinearBlockSparseTensorsTorch,
+    seqlen_q: int,
+    q_super_block: int,
+) -> torch.Tensor:
+    """Set ``max_score`` slots to ``-inf`` for K-blocks not in the forward sparse list per Q super-block.
+
+    ``linear_k`` must match ``create_block_mask(..., BLOCK_SIZE=(q_super_block, 128))`` used for Q2K.
+    """
+    out = ref_dense.clone()
+    _, _, _, n_chunks = out.shape
+    num_qb = (seqlen_q + q_super_block - 1) // q_super_block
+    assert int(linear_k.mask_block_offset.shape[0]) == num_qb + 1, (
+        f"mask_block_offset len {linear_k.mask_block_offset.shape[0]} != num_qb+1={num_qb + 1}"
+    )
+    for m in range(num_qb):
+        q_lo = m * q_super_block
+        q_hi = min((m + 1) * q_super_block, seqlen_q)
+        s = int(linear_k.mask_block_offset[m].item())
+        e = int(linear_k.mask_block_offset[m + 1].item())
+        mask_nb = linear_k.mask_block_idx[s:e].long()
+        parts = [mask_nb]
+        if linear_k.full_block_idx is not None and linear_k.full_block_offset is not None:
+            fs = int(linear_k.full_block_offset[m].item())
+            fe = int(linear_k.full_block_offset[m + 1].item())
+            parts.append(linear_k.full_block_idx[fs:fe].long())
+        visited = torch.cat(parts)
+        visited = visited[(visited >= 0) & (visited < n_chunks)]
+        vis = torch.zeros(n_chunks, dtype=torch.bool, device=out.device)
+        vis[visited] = True
+        out[:, :, q_lo:q_hi, ~vis] = float("-inf")
     return out
 
 
@@ -542,6 +793,436 @@ def _run_mask_test(
     assert (dv - dv_ref_fp32).abs().max().item() <= 5 * (dv_ref - dv_ref_fp32).abs().max().item()
     assert (dk - dk_ref_fp32).abs().max().item() <= 5 * (dk_ref - dk_ref_fp32).abs().max().item()
     assert (dq - dq_ref_fp32).abs().max().item() <= 5 * (dq_ref - dq_ref_fp32).abs().max().item()
+
+
+def test_per_doc_block_score_2doc_noncausal():
+    """Verify per-doc block scores left-aligned with 2-doc non-causal packing."""
+    if COMPUTE_CAPABILITY != 10:
+        pytest.skip("per-doc block scoring requires SM 10.x")
+
+    torch.manual_seed(42)
+
+    # 2 docs packed: doc0 len=300, doc1 len=200, total=500
+    # doc1 starts at 300, 300 % 128 = 44 ≠ 0 → non-trivial split
+    doc0_len = 300
+    doc1_len = 200
+    seqlen = doc0_len + doc1_len  # 500
+    block_size_k = 128
+    nheads = 2
+    headdim = 128
+    dtype = torch.bfloat16
+    batch_size = 1
+
+    # Per-doc buffer: ceil(max_doc_len / block_size_k)
+    max_doc_len = max(doc0_len, doc1_len)  # 300
+    max_seqblock_k = (max_doc_len + block_size_k - 1) // block_size_k  # 3
+
+    tensors = create_tensors(batch_size, seqlen, seqlen, nheads, nheads, headdim, headdim, dtype)
+    softmax_scale = 1.0 / math.sqrt(headdim)
+
+    # Build arbitrary_func for 2-doc packing (func_num=3, non-causal within doc)
+    # af[b, 0, 0, q] = cutoff (0 → no base valid)
+    # af[b, 0, 1, q] = doc_k_start
+    # af[b, 0, 2, q] = doc_k_end
+    af = torch.zeros(1, 1, 3, seqlen + 256, dtype=torch.int32, device="cuda")
+    # Doc 0: q in [0, 300), K range [0, 300)
+    af[0, 0, 0, :doc0_len] = 0
+    af[0, 0, 1, :doc0_len] = 0
+    af[0, 0, 2, :doc0_len] = doc0_len
+    # Doc 1: q in [300, 500), K range [300, 500)
+    af[0, 0, 0, doc0_len:seqlen] = 0
+    af[0, 0, 1, doc0_len:seqlen] = doc0_len  # doc_k_start = 300
+    af[0, 0, 2, doc0_len:seqlen] = seqlen     # doc_k_end = 500
+
+    max_score_out = torch.full(
+        (batch_size, nheads, seqlen, max_seqblock_k),
+        float("-inf"), dtype=torch.float32, device="cuda",
+    )
+    block_lse_out = torch.full(
+        (batch_size, nheads, seqlen, max_seqblock_k),
+        float("-inf"), dtype=torch.float32, device="cuda",
+    )
+
+    out, lse = _flash_attn_fwd(
+        tensors["q"], tensors["k"], tensors["v"],
+        softmax_scale=softmax_scale,
+        causal=False,
+        arbitrary=True,
+        window_size_left=None, window_size_right=None,
+        learnable_sink=None, softcap=0.0, num_splits=1, pack_gqa=False,
+        mask_mod=None, block_sparse_tensors=None,
+        aux_tensors=[af],
+        max_score_out=max_score_out,
+        block_lse_out=block_lse_out,
+        k_sparse_block_size=block_size_k,
+    )
+
+    # Doc 0: doc_k_start=0, doc_len=300, n_valid=ceil(300/128)=3
+    # Doc 1: doc_k_start=300, doc_len=200, n_valid=ceil(200/128)=2
+    n_valid_doc0 = (doc0_len + block_size_k - 1) // block_size_k  # 3
+    n_valid_doc1 = (doc1_len + block_size_k - 1) // block_size_k  # 2
+
+    print(f"\n=== Per-doc block score alignment test ===")
+    print(f"Doc 0: len={doc0_len}, n_valid={n_valid_doc0}, max_seqblock_k={max_seqblock_k}")
+    print(f"Doc 1: len={doc1_len}, n_valid={n_valid_doc1}, max_seqblock_k={max_seqblock_k}")
+
+    # Pick representative Q rows
+    q_doc0 = seqlen // 4       # middle of doc 0
+    q_doc1 = doc0_len + doc1_len // 2  # middle of doc 1
+
+    ms_doc0 = max_score_out[0, 0, q_doc0]  # (max_seqblock_k,)
+    ms_doc1 = max_score_out[0, 0, q_doc1]  # (max_seqblock_k,)
+
+    print(f"\nmax_score_out[q={q_doc0}] (Doc 0): {ms_doc0.tolist()}")
+    print(f"max_score_out[q={q_doc1}] (Doc 1): {ms_doc1.tolist()}")
+
+    # Check Doc 1 (the interesting case: doc_k_start=300, 300%128=44≠0)
+    # With per-doc output: slots [0, 1] finite, slot [2] = -inf
+    doc1_finite = torch.isfinite(ms_doc1)
+    print(f"\nDoc 1 finite mask: {doc1_finite.tolist()}")
+
+    assert doc1_finite[:n_valid_doc1].all(), (
+        f"Doc 1 should have {n_valid_doc1} valid blocks at [0..{n_valid_doc1-1}]"
+    )
+    assert not doc1_finite[n_valid_doc1:].any(), (
+        f"Doc 1 should have -inf at [{n_valid_doc1}..{max_seqblock_k-1}]"
+    )
+    print(f"Doc 1: {n_valid_doc1} valid blocks left-aligned ✓")
+
+    # Also verify Doc 0 (doc_k_start=0, should fill all 3 valid slots)
+    doc0_finite = torch.isfinite(ms_doc0)
+    print(f"\nDoc 0 finite mask: {doc0_finite.tolist()}")
+    assert doc0_finite[:n_valid_doc0].all(), f"Doc 0 should have {n_valid_doc0} valid blocks"
+
+    # Cross-check with reference
+    ref_max = compute_reference_per_doc_block_max_scores(tensors, af, max_seqlen_k=max_doc_len)
+    finite_mask_ms = torch.isfinite(ref_max) & torch.isfinite(max_score_out)
+    inf_mismatch = torch.isfinite(ref_max) != torch.isfinite(max_score_out)
+    if inf_mismatch.any():
+        positions = torch.nonzero(inf_mismatch)
+        print(f"\n-inf mismatch at {positions.shape[0]} positions, first 5:")
+        for idx in positions[:5]:
+            b, h, q, k_idx = idx.tolist()
+            print(f"  [{b},{h},{q},{k_idx}] kernel={max_score_out[b,h,q,k_idx].item():.4f} ref={ref_max[b,h,q,k_idx].item():.4f}")
+    diff = (max_score_out[finite_mask_ms] - ref_max[finite_mask_ms]).abs()
+    if diff.numel() > 0:
+        print(f"\nmax_score finite diff max: {diff.max().item():.4f}, avg: {diff.mean().item():.4f}")
+    # Find top-5 largest diffs with positions
+    full_diff = (max_score_out - ref_max).abs()
+    full_diff[~finite_mask_ms] = 0
+    top5_vals, top5_flat = full_diff.view(-1).topk(5)
+    print("Top-5 max_score diffs:")
+    for val, flat_idx in zip(top5_vals, top5_flat):
+        b = flat_idx // (nheads * seqlen * max_seqblock_k)
+        rem = flat_idx % (nheads * seqlen * max_seqblock_k)
+        h = rem // (seqlen * max_seqblock_k)
+        rem2 = rem % (seqlen * max_seqblock_k)
+        q = rem2 // max_seqblock_k
+        kb = rem2 % max_seqblock_k
+        print(f"  [{b},{h},{q},{kb}] diff={val.item():.4f} kernel={max_score_out[b,h,q,kb].item():.4f} ref={ref_max[b,h,q,kb].item():.4f}")
+    assert not inf_mismatch.any(), (
+        f"max_score -inf positions mismatch at {inf_mismatch.sum().item()} positions"
+    )
+    assert diff.max().item() < 0.5, (
+        f"max_score mismatch max diff {diff.max().item()}"
+    )
+
+    ref_lse = compute_reference_per_doc_block_lse(tensors, softmax_scale, af, max_seqlen_k=max_doc_len)
+    finite_mask = torch.isfinite(ref_lse)
+    diff_lse = (block_lse_out[finite_mask] - ref_lse[finite_mask]).abs()
+    print(f"block_lse vs reference diff max: {diff_lse.max().item()}")
+    assert torch.allclose(block_lse_out[finite_mask], ref_lse[finite_mask], rtol=0.06, atol=0.2), (
+        f"block_lse mismatch max diff {diff_lse.max().item()}"
+    )
+    print("\nAll checks passed!")
+
+
+def test_per_doc_block_score_3doc_varlen_causal():
+    """Verify per-doc block scores with 3-doc varlen causal packing.
+
+    Causal is encoded in the arbitrary_func interval by setting
+    k_end[q] = min(q + 1, doc_end) so each query only attends to
+    earlier keys within its own document.
+    """
+    if COMPUTE_CAPABILITY != 10:
+        pytest.skip("per-doc block scoring requires SM 10.x")
+
+    torch.manual_seed(42)
+
+    # 3 docs packed: doc0=300, doc1=200, doc2=150, total=650
+    # doc1 starts at 300 (300 % 128 = 44 ≠ 0)
+    # doc2 starts at 500 (500 % 128 = 116 ≠ 0)
+    doc0_len = 300
+    doc1_len = 200
+    doc2_len = 150
+    seqlen = doc0_len + doc1_len + doc2_len  # 650
+    doc0_start = 0
+    doc1_start = doc0_len          # 300
+    doc2_start = doc0_len + doc1_len  # 500
+    block_size_k = 128
+    nheads = 2
+    headdim = 128
+    dtype = torch.bfloat16
+    batch_size = 1
+
+    max_doc_len = max(doc0_len, doc1_len, doc2_len)  # 300
+    max_seqblock_k = (max_doc_len + block_size_k - 1) // block_size_k  # 3
+
+    tensors = create_tensors(batch_size, seqlen, seqlen, nheads, nheads, headdim, headdim, dtype)
+    softmax_scale = 1.0 / math.sqrt(headdim)
+
+    # Build arbitrary_func for 3-doc varlen causal (func_num=3)
+    # af[b, 0, 0, q] = cutoff (0 → no base valid, causal encoded in interval)
+    # af[b, 0, 1, q] = doc_k_start
+    # af[b, 0, 2, q] = min(q + 1, doc_k_end)  ← causal within doc
+    af = torch.zeros(1, 1, 3, seqlen + 256, dtype=torch.int32, device="cuda")
+
+    q_indices = torch.arange(seqlen, device="cuda")
+
+    # Doc 0: q in [0, 300), K range [0, min(q+1, 300))
+    af[0, 0, 0, :doc0_len] = 0
+    af[0, 0, 1, :doc0_len] = doc0_start
+    af[0, 0, 2, :doc0_len] = torch.minimum(
+        q_indices[:doc0_len] + 1,
+        torch.tensor(doc0_start + doc0_len, device="cuda"),
+    ).to(torch.int32)
+
+    # Doc 1: q in [300, 500), K range [300, min(q+1, 500))
+    af[0, 0, 0, doc1_start:doc2_start] = 0
+    af[0, 0, 1, doc1_start:doc2_start] = doc1_start
+    af[0, 0, 2, doc1_start:doc2_start] = torch.minimum(
+        q_indices[doc1_start:doc2_start] + 1,
+        torch.tensor(doc1_start + doc1_len, device="cuda"),
+    ).to(torch.int32)
+
+    # Doc 2: q in [500, 650), K range [500, min(q+1, 650))
+    af[0, 0, 0, doc2_start:seqlen] = 0
+    af[0, 0, 1, doc2_start:seqlen] = doc2_start
+    af[0, 0, 2, doc2_start:seqlen] = torch.minimum(
+        q_indices[doc2_start:seqlen] + 1,
+        torch.tensor(doc2_start + doc2_len, device="cuda"),
+    ).to(torch.int32)
+
+    max_score_out = torch.full(
+        (batch_size, nheads, seqlen, max_seqblock_k),
+        float("-inf"), dtype=torch.float32, device="cuda",
+    )
+    block_lse_out = torch.full(
+        (batch_size, nheads, seqlen, max_seqblock_k),
+        float("-inf"), dtype=torch.float32, device="cuda",
+    )
+
+    out, lse = _flash_attn_fwd(
+        tensors["q"], tensors["k"], tensors["v"],
+        softmax_scale=softmax_scale,
+        causal=False,
+        arbitrary=True,
+        window_size_left=None, window_size_right=None,
+        learnable_sink=None, softcap=0.0, num_splits=1, pack_gqa=False,
+        mask_mod=None, block_sparse_tensors=None,
+        aux_tensors=[af],
+        max_score_out=max_score_out,
+        block_lse_out=block_lse_out,
+        k_sparse_block_size=block_size_k,
+    )
+
+    n_valid_doc0 = (doc0_len + block_size_k - 1) // block_size_k  # 3
+    n_valid_doc1 = (doc1_len + block_size_k - 1) // block_size_k  # 2
+    n_valid_doc2 = (doc2_len + block_size_k - 1) // block_size_k  # 2
+
+    print(f"\n=== Per-doc block score 3-doc varlen causal test ===")
+    print(f"Doc 0: start={doc0_start}, len={doc0_len}, n_valid={n_valid_doc0}")
+    print(f"Doc 1: start={doc1_start}, len={doc1_len}, n_valid={n_valid_doc1}")
+    print(f"Doc 2: start={doc2_start}, len={doc2_len}, n_valid={n_valid_doc2}")
+
+    # Pick representative Q rows (last row of each doc sees all its K blocks)
+    q_doc0 = doc0_len - 1           # 299 — last row of doc 0
+    q_doc1 = doc2_start - 1         # 499 — last row of doc 1
+    q_doc2 = seqlen - 1             # 649 — last row of doc 2
+    # Also check early row in doc 1 (only covers first K block of its doc)
+    q_doc1_early = doc1_start       # 300 — first row of doc 1
+
+    ms_doc0 = max_score_out[0, 0, q_doc0]
+    ms_doc1 = max_score_out[0, 0, q_doc1]
+    ms_doc2 = max_score_out[0, 0, q_doc2]
+    ms_doc1_early = max_score_out[0, 0, q_doc1_early]
+
+    print(f"\nmax_score_out[q={q_doc0}] (Doc 0 last): {ms_doc0.tolist()}")
+    print(f"max_score_out[q={q_doc1}] (Doc 1 last): {ms_doc1.tolist()}")
+    print(f"max_score_out[q={q_doc2}] (Doc 2 last): {ms_doc2.tolist()}")
+    print(f"max_score_out[q={q_doc1_early}] (Doc 1 first): {ms_doc1_early.tolist()}")
+
+    # Doc 0 last row: sees all 3 K blocks of doc 0
+    doc0_finite = torch.isfinite(ms_doc0)
+    assert doc0_finite[:n_valid_doc0].all(), (
+        f"Doc 0 last row should have {n_valid_doc0} valid blocks"
+    )
+
+    # Doc 1 last row: sees all 2 K blocks of doc 1
+    doc1_finite = torch.isfinite(ms_doc1)
+    assert doc1_finite[:n_valid_doc1].all(), (
+        f"Doc 1 last row should have {n_valid_doc1} valid blocks at [0..{n_valid_doc1-1}]"
+    )
+    assert not doc1_finite[n_valid_doc1:].any(), (
+        f"Doc 1 last row should have -inf at [{n_valid_doc1}..{max_seqblock_k-1}]"
+    )
+
+    # Doc 2 last row: sees all 2 K blocks of doc 2
+    doc2_finite = torch.isfinite(ms_doc2)
+    assert doc2_finite[:n_valid_doc2].all(), (
+        f"Doc 2 last row should have {n_valid_doc2} valid blocks at [0..{n_valid_doc2-1}]"
+    )
+    assert not doc2_finite[n_valid_doc2:].any(), (
+        f"Doc 2 last row should have -inf at [{n_valid_doc2}..{max_seqblock_k-1}]"
+    )
+
+    # Doc 1 first row (q=300): causal → k_end = min(301, 500) = 301
+    # Only 1 key visible (k=300), so only 1 K block valid
+    doc1_early_finite = torch.isfinite(ms_doc1_early)
+    assert doc1_early_finite[0], "Doc 1 first row should have at least 1 valid block"
+    assert not doc1_early_finite[1:].any(), (
+        f"Doc 1 first row (q={q_doc1_early}) causal: only 1 key visible, expect 1 valid block"
+    )
+    print(f"Doc 1 first row causal check (1 valid block) ✓")
+
+    # Cross-check with reference
+    ref_max = compute_reference_per_doc_block_max_scores(tensors, af, max_seqlen_k=max_doc_len)
+    finite_mask_ms = torch.isfinite(ref_max) & torch.isfinite(max_score_out)
+    inf_mismatch = torch.isfinite(ref_max) != torch.isfinite(max_score_out)
+    if inf_mismatch.any():
+        positions = torch.nonzero(inf_mismatch)
+        print(f"\n-inf mismatch at {positions.shape[0]} positions, first 5:")
+        for idx in positions[:5]:
+            b, h, q, k_idx = idx.tolist()
+            print(f"  [{b},{h},{q},{k_idx}] kernel={max_score_out[b,h,q,k_idx].item():.4f} ref={ref_max[b,h,q,k_idx].item():.4f}")
+    diff = (max_score_out[finite_mask_ms] - ref_max[finite_mask_ms]).abs()
+    if diff.numel() > 0:
+        print(f"\nmax_score finite diff max: {diff.max().item():.4f}, avg: {diff.mean().item():.4f}")
+    assert not inf_mismatch.any(), (
+        f"max_score -inf positions mismatch at {inf_mismatch.sum().item()} positions"
+    )
+    assert diff.max().item() < 0.5, (
+        f"max_score mismatch max diff {diff.max().item()}"
+    )
+
+    ref_lse = compute_reference_per_doc_block_lse(tensors, softmax_scale, af, max_seqlen_k=max_doc_len)
+    finite_mask = torch.isfinite(ref_lse)
+    diff_lse = (block_lse_out[finite_mask] - ref_lse[finite_mask]).abs()
+    print(f"block_lse vs reference diff max: {diff_lse.max().item()}")
+    assert torch.allclose(block_lse_out[finite_mask], ref_lse[finite_mask], rtol=0.06, atol=0.2), (
+        f"block_lse mismatch max diff {diff_lse.max().item()}"
+    )
+    print("\nAll checks passed!")
+
+
+def test_arbitrary_mask_block_score_and_lse():
+    """``max_score_out`` + ``block_lse_out`` with block sparsity + arbitrary mask (SM100)."""
+    if COMPUTE_CAPABILITY != 10:
+        pytest.skip("max_score_out / block_lse_out block-sparse path is only exercised on SM 10.x")
+
+    torch.manual_seed(0)
+
+    seqlen_q, seqlen_k = 256, 256
+    tile_m, tile_n = 128, 128
+    sparse_tile_m = 2 * tile_m
+    nheads = 4
+    nheads_kv = nheads
+    headdim = 128
+    dtype = torch.bfloat16
+    batch_size = 1
+
+    _, mask_mod_flex = get_mask_pair("arbitrary")
+    arbitrary_func = random_arbitrary_func_tensor(
+        1, 1, 3, seqlen_q, seqlen_k, device="cuda"
+    )
+    frozen_af = arbitrary_func
+
+    def mask_mod_wrap(b, h, q_idx, kv_idx, f=frozen_af):
+        return mask_mod_flex(b, h, q_idx, kv_idx, f)
+
+    tensors = create_tensors(
+        batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim, dtype
+    )
+    headdim = tensors["q"].shape[3]
+    softmax_scale = 1.0 / math.sqrt(headdim)
+
+    bm = create_block_mask(
+        mask_mod_wrap,
+        1,
+        1,
+        seqlen_q,
+        seqlen_k,
+        device="cuda",
+        BLOCK_SIZE=(sparse_tile_m, tile_n),
+    )
+    _, _, k_mask_cnt, k_mask_idx, k_full_cnt, k_full_idx, *_ = bm.as_tuple()
+    k_bsm = BlockSparseTensorsTorch(
+        mask_block_cnt=k_mask_cnt,
+        mask_block_idx=k_mask_idx,
+        full_block_cnt=k_full_cnt,
+        full_block_idx=k_full_idx,
+    )
+    linear_k = bhqk_to_linear_sparse_tensors(k_bsm)
+
+    num_k_chunks = (seqlen_k + 127) // 128
+    max_score_out = torch.empty(
+        batch_size, nheads, seqlen_q, num_k_chunks,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    block_lse_out = torch.empty(
+        batch_size, nheads, seqlen_q, num_k_chunks,
+        dtype=torch.float32,
+        device="cuda",
+    )
+
+    out, lse = _flash_attn_fwd(
+        tensors["q"],
+        tensors["k"],
+        tensors["v"],
+        softmax_scale=softmax_scale,
+        causal=False,
+        arbitrary=True,
+        window_size_left=None,
+        window_size_right=None,
+        learnable_sink=None,
+        softcap=0.0,
+        num_splits=1,
+        pack_gqa=False,
+        mask_mod=None,
+        block_sparse_tensors=linear_k,
+        aux_tensors=[arbitrary_func],
+        max_score_out=max_score_out,
+        block_lse_out=block_lse_out,
+        k_sparse_block_size=128,
+    )
+
+    assert out.shape == tensors["out"].shape
+    assert torch.isfinite(out).all()
+
+    # --- max_score check (per-doc block scoring) ---
+    ref_max = compute_reference_per_doc_block_max_scores(
+        tensors, arbitrary_func, linear_k=linear_k, q_super_block=sparse_tile_m,
+    )
+    diff_ms = (max_score_out - ref_max).abs()
+    print(f"max_score_out sparse diff max: {diff_ms.max().item()}, avg: {diff_ms.mean().item()}")
+    assert torch.allclose(
+        max_score_out, ref_max, rtol=0.06, atol=0.2,
+    ), f"sparse max_score mismatch max diff {diff_ms.max().item()}"
+
+    # --- block_lse check (per-doc block scoring) ---
+    ref_lse = compute_reference_per_doc_block_lse(
+        tensors, softmax_scale, arbitrary_func,
+        linear_k=linear_k, q_super_block=sparse_tile_m,
+    )
+    diff_lse = (block_lse_out - ref_lse).abs()
+    finite_mask = torch.isfinite(ref_lse)
+    diff_finite = diff_lse[finite_mask]
+    print(f"block_lse_out sparse diff max: {diff_finite.max().item()}, avg: {diff_finite.mean().item()}")
+    assert torch.allclose(
+        block_lse_out[finite_mask], ref_lse[finite_mask], rtol=0.06, atol=0.2,
+    ), f"sparse block_lse mismatch max diff {diff_finite.max().item()}"
+    _ = lse
 
 
 def test_arbitrary_mask(

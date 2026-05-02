@@ -1,7 +1,5 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
-# [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'll need install nvidia-cutlass-dsl==4.2.0.
-# [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'll need install nvidia-cutlass-dsl==4.2.0.
-# [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'll need install nvidia-cutlass-dsl==4.2.0.
+# Version in Cute-DSL, for Hopper and Blackwell. Requires nvidia-cutlass-dsl>=4.4.2.
 
 # Supported features:
 # - BF16 & FP16 dtype
@@ -103,6 +101,9 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
+    max_score_out: Optional[torch.Tensor] = None,
+    block_lse_out: Optional[torch.Tensor] = None,
+    k_sparse_block_size: int = 128,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -115,6 +116,15 @@ def _flash_attn_fwd(
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
+        max_score_out: If not ``None`` (SM100 only), enables the extra per-K-block row ``fmax_reduce``
+            in the softmax warp. Block maxima are stored in shared memory only; this tensor is **not**
+            written (callers may still pass a correctly shaped buffer for API/compile consistency).
+            Shape: ``(batch, num_head, seqlen_q, ceil(seqlen_k / k_sparse_block_size))`` for fixed-length,
+            or ``(num_head, total_q, num_chunks)`` when ``cu_seqlens_q`` is set. Dtype float32.
+        block_lse_out: If not ``None`` (SM100 only), outputs per-K-block scaled LSE values
+            ``log(sum(exp(S * softmax_scale)))`` for each K block. Same shape and dtype as
+            ``max_score_out``. Useful for recomputing attention output / LSE when removing blocks.
+        k_sparse_block_size: K-axis chunk size for max score reduction; must equal ``n_block_size`` (128).
     """
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
@@ -252,6 +262,22 @@ def _flash_attn_fwd(
     )
 
     assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
+    if max_score_out is not None:
+        assert compute_capability == 10, (
+            "max_score_out is only supported on SM 10.x (Blackwell / FA4 cute path)"
+        )
+        assert k_sparse_block_size == n_block_size, (
+            f"k_sparse_block_size ({k_sparse_block_size}) must equal n_block_size ({n_block_size}) "
+            "for max_score_out"
+        )
+    if block_lse_out is not None:
+        assert compute_capability == 10, (
+            "block_lse_out is only supported on SM 10.x (Blackwell / FA4 cute path)"
+        )
+        assert k_sparse_block_size == n_block_size, (
+            f"k_sparse_block_size ({k_sparse_block_size}) must equal n_block_size ({n_block_size}) "
+            "for block_lse_out"
+        )
 
     use_block_sparsity = block_sparse_tensors is not None
     if use_block_sparsity:
@@ -317,6 +343,10 @@ def _flash_attn_fwd(
     if is_split_kv:
         out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
         lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
+    if max_score_out is not None:
+        assert not is_split_kv, "max_score_out is not supported with split KV"
+    if block_lse_out is not None:
+        assert not is_split_kv, "block_lse_out is not supported with split KV"
 
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
@@ -362,6 +392,56 @@ def _flash_attn_fwd(
                 "Block sparsity is not yet supported with SplitKV. TODO: partition sparse block lists per split."
             )
 
+    if max_score_out is not None:
+        assert page_table is None, "max_score_out is not supported with paged KV"
+        if not arbitrary:
+            num_k_chunks_ms = (seqlen_k + k_sparse_block_size - 1) // k_sparse_block_size
+            if cu_seqlens_q is None:
+                expected_ms = (batch_size, num_head, seqlen_q, num_k_chunks_ms)
+            else:
+                expected_ms = (num_head, total_q, num_k_chunks_ms)
+            assert max_score_out.shape == expected_ms, (
+                f"max_score_out shape {max_score_out.shape} != expected {expected_ms}"
+            )
+        else:
+            if cu_seqlens_q is None:
+                assert max_score_out.shape[:3] == (batch_size, num_head, seqlen_q), (
+                    f"max_score_out shape prefix {max_score_out.shape[:3]} != expected {(batch_size, num_head, seqlen_q)}"
+                )
+            else:
+                assert max_score_out.shape[:2] == (num_head, total_q), (
+                    f"max_score_out shape prefix {max_score_out.shape[:2]} != expected {(num_head, total_q)}"
+                )
+        assert max_score_out.dtype == torch.float32, "max_score_out must be float32"
+        assert max_score_out.device == device, "max_score_out must be on the same device as q"
+        assert max_score_out.is_cuda, "max_score_out must be a CUDA tensor"
+        max_score_out.fill_(float("-inf"))
+
+    if block_lse_out is not None:
+        assert page_table is None, "block_lse_out is not supported with paged KV"
+        if not arbitrary:
+            num_k_chunks_bl = (seqlen_k + k_sparse_block_size - 1) // k_sparse_block_size
+            if cu_seqlens_q is None:
+                expected_bl = (batch_size, num_head, seqlen_q, num_k_chunks_bl)
+            else:
+                expected_bl = (num_head, total_q, num_k_chunks_bl)
+            assert block_lse_out.shape == expected_bl, (
+                f"block_lse_out shape {block_lse_out.shape} != expected {expected_bl}"
+            )
+        else:
+            if cu_seqlens_q is None:
+                assert block_lse_out.shape[:3] == (batch_size, num_head, seqlen_q), (
+                    f"block_lse_out shape prefix {block_lse_out.shape[:3]} != expected {(batch_size, num_head, seqlen_q)}"
+                )
+            else:
+                assert block_lse_out.shape[:2] == (num_head, total_q), (
+                    f"block_lse_out shape prefix {block_lse_out.shape[:2]} != expected {(num_head, total_q)}"
+                )
+        assert block_lse_out.dtype == torch.float32, "block_lse_out must be float32"
+        assert block_lse_out.device == device, "block_lse_out must be on the same device as q"
+        assert block_lse_out.is_cuda, "block_lse_out must be a CUDA tensor"
+        block_lse_out.fill_(float("-inf"))
+
     compile_key = (
         dtype,
         head_dim,
@@ -390,6 +470,8 @@ def _flash_attn_fwd(
         pack_gqa,
         compute_capability,
         page_size not in [None, 128],  # paged KV non-TMA
+        max_score_out is not None,
+        block_lse_out is not None,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         # Only create from_dlpack tensors when compilation is needed
@@ -439,7 +521,19 @@ def _flash_attn_fwd(
         cute_aux_tensors = None
         if aux_tensors is not None:
             cute_aux_tensors = [from_dlpack(buf, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=buf.ndim - 1) for buf in aux_tensors]
-        
+
+        max_score_tensor = (
+            from_dlpack(max_score_out.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=max_score_out.ndim - 1)
+            if max_score_out is not None
+            else None
+        )
+
+        block_lse_tensor = (
+            from_dlpack(block_lse_out.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=block_lse_out.ndim - 1)
+            if block_lse_out is not None
+            else None
+        )
+
         if compute_capability == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
             assert not is_split_kv, "SplitKV not supported on SM 9.0"
@@ -490,6 +584,8 @@ def _flash_attn_fwd(
                 paged_kv_non_tma=page_size not in [None, 128],
                 is_varlen_q=cu_seqlens_q is not None
                     or seqused_q is not None,
+                return_max_score=max_score_out is not None,
+                return_block_lse=block_lse_out is not None,
             )
         else:
             raise ValueError(
@@ -497,7 +593,7 @@ def _flash_attn_fwd(
             )
         # TODO: check @can_implement
         # Compile with from_dlpack tensors, execute with torch tensors directly
-        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+        _fwd_compile_args = (
             fa_fwd,
             q_tensor,
             k_tensor,
@@ -516,14 +612,23 @@ def _flash_attn_fwd(
             learnable_sink_tensor,
             cute_block_sparse_tensors,
             cute_aux_tensors,
-            options="--enable-tvm-ffi"  
-            # ref doc: https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/compile_with_tvm_ffi.html
-            # pip install apache-tvm-ffi 
-            # pip install torch-c-dlpack-ext
         )
+        if compute_capability == 9:
+            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+                *_fwd_compile_args,
+                options="--enable-tvm-ffi",
+            )
+        else:
+            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+                *_fwd_compile_args,
+                max_score_tensor,
+                block_lse_tensor,
+                options="--enable-tvm-ffi",
+            )
+            # ref doc: https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/compile_with_tvm_ffi.html
     # Execute with torch tensors directly (TVM FFI compiled functions accept DLPack-compatible tensors)
     with torch.cuda.nvtx.range("flash_attn_fwd_kernel"):
-        _flash_attn_fwd.compile_cache[compile_key](
+        _fwd_exec_args = (
             q,
             k,
             v,
@@ -542,6 +647,10 @@ def _flash_attn_fwd(
             block_sparse_tensors,
             aux_tensors,
         )
+        if compute_capability == 9:
+            _flash_attn_fwd.compile_cache[compile_key](*_fwd_exec_args)
+        else:
+            _flash_attn_fwd.compile_cache[compile_key](*_fwd_exec_args, max_score_out, block_lse_out)
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,

@@ -88,14 +88,14 @@ def mask_r2p_intervals(
     # Ideally we'd move by 32 instead of 24, but mask >> i isn't correct for i == 31
     for s in cutlass.range_constexpr(cute.ceil_div(ncol, 24)):
         # first interval [0, col_max[0])
-        col_max_0_s = max(col_limits[0] - s * 24, 0)
+        col_max_0_s = min(max(col_limits[0] - s * 24, 0), 24)
         combined_mask = (1 << col_max_0_s) - 1
-        
+
         # subsequent intervals [col_min[j], col_max[j+1])
         # in col_limits: col_min[j] = col_limits[2*j + 1], col_max[j+1] = col_limits[2*j + 2]
         for j in cutlass.range_constexpr(num_intervals):
-            col_min_s = max(col_limits[2 * j + 1] - s * 24, 0)
-            col_max_s = max(col_limits[2 * j + 2] - s * 24, 0)
+            col_min_s = min(max(col_limits[2 * j + 1] - s * 24, 0), 24)
+            col_max_s = min(max(col_limits[2 * j + 2] - s * 24, 0), 24)
             # XOR to generate mask for interval [col_min, col_max)
             interval_mask = ((1 << col_max_s) - 1) ^ ((1 << col_min_s) - 1)
             combined_mask = combined_mask | interval_mask

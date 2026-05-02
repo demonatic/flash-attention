@@ -88,6 +88,8 @@ class FlashAttentionForwardSm100:
         has_aux_tensors: cutlass.Constexpr = False,
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
+        return_max_score: bool = False,
+        return_block_lse: bool = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -120,6 +122,9 @@ class FlashAttentionForwardSm100:
         self.func_num = func_num
         self.is_varlen_q = is_varlen_q
         self.use_correction_warps_for_epi = is_varlen_q
+        self.return_max_score = return_max_score
+        self.return_block_lse = return_block_lse
+        self.per_doc_block_scoring = return_max_score or return_block_lse
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_split_kv = is_split_kv
         self.pack_gqa = pack_gqa
@@ -267,6 +272,8 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[LinearBlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        mMaxScore: Optional[cute.Tensor] = None,
+        mBlockLSE: Optional[cute.Tensor] = None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -317,6 +324,22 @@ class FlashAttentionForwardSm100:
             if const_expr(mLSE is not None)
             else None
         )
+        if cutlass.const_expr(self.return_max_score):
+            if const_expr(mMaxScore is not None):
+                if const_expr(mCuSeqlensQ is None):
+                    MaxScore_layout_transpose = [2, 3, 1, 0]
+                    mMaxScore = cute.make_tensor(
+                        mMaxScore.iterator,
+                        cute.select(mMaxScore.layout, mode=MaxScore_layout_transpose),
+                    )
+        if cutlass.const_expr(self.return_block_lse):
+            if const_expr(mBlockLSE is not None):
+                if const_expr(mCuSeqlensQ is None):
+                    BlockLSE_layout_transpose = [2, 3, 1, 0]
+                    mBlockLSE = cute.make_tensor(
+                        mBlockLSE.iterator,
+                        cute.select(mBlockLSE.layout, mode=BlockLSE_layout_transpose),
+                    )
         # (s, d, h, b) -> (d, s, h, b)
         V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
         mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
@@ -708,6 +731,8 @@ class FlashAttentionForwardSm100:
             num_splits,
             aux_tensors,
             fastdiv_mods,
+            mMaxScore,
+            mBlockLSE,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -754,6 +779,8 @@ class FlashAttentionForwardSm100:
         num_splits: Int32,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
+        mMaxScore: Optional[cute.Tensor] = None,
+        mBlockLSE: Optional[cute.Tensor] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1061,6 +1088,9 @@ class FlashAttentionForwardSm100:
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
                 blocksparse_tensors=blocksparse_tensors,
+                mMaxScore=mMaxScore,
+                mBlockLSE=mBlockLSE,
+                mCuSeqlensQ=mCuSeqlensQ,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -1109,6 +1139,7 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 TileSchedulerCls,
                 blocksparse_tensors,
+                mMaxScore,
             )
             cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
 
@@ -1297,6 +1328,7 @@ class FlashAttentionForwardSm100:
                     pipeline_kv,
                     self.q_stage,
                     q_producer_phase,
+                    merged_order=True,
                 )
 
 
@@ -1556,6 +1588,9 @@ class FlashAttentionForwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[LinearBlockSparseTensors] = None,
+        mMaxScore: Optional[cute.Tensor] = None,
+        mBlockLSE: Optional[cute.Tensor] = None,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -1662,6 +1697,41 @@ class FlashAttentionForwardSm100:
             )
             softmax.reset()
 
+            if const_expr(self.per_doc_block_scoring):
+                m_block_adj = self.q_stage * m_block + stage
+                q_row_global = m_block_adj * self.m_block_size + tidx
+                if const_expr(self.func_num >= 3):
+                    pd_doc_k_start = aux_tensors[0][batch_idx, 0, 1, q_row_global]
+                    pd_doc_k_end = aux_tensors[0][batch_idx, 0, 2, q_row_global]
+                elif const_expr(aux_tensors is not None):
+                    pd_doc_k_start = Int32(0)
+                    pd_doc_k_end = aux_tensors[0][batch_idx, 0, 0, q_row_global]
+                else:
+                    pd_doc_k_start = Int32(0)
+                    pd_doc_k_end = seqlen.seqlen_k
+                if pd_doc_k_end <= pd_doc_k_start:
+                    pd_doc_k_start = Int32(0)
+                    pd_doc_k_end = seqlen.seqlen_k
+                pd_split_col = pd_doc_k_start % self.n_block_size
+                pd_doc_len = pd_doc_k_end - pd_doc_k_start
+                pd_doc_n_blocks = (pd_doc_len + self.n_block_size - 1) // self.n_block_size
+                pd_doc_k_start_tile = pd_doc_k_start // self.n_block_size
+                pd_deferred = cute.make_fragment((8,), Float32)
+                pd_deferred[0] = -Float32.inf  # max_right
+                pd_deferred[1] = -Float32.inf  # max_left
+                pd_deferred[2] = -Float32.inf  # lse_right
+                pd_deferred[3] = -Float32.inf  # lse_left
+                pd_deferred[4] = Float32(-1.0) # block_right (as float)
+                pd_deferred[5] = Float32(-1.0) # block_left (as float)
+                pd_deferred[6] = Float32(0.0)  # has_right
+                pd_deferred[7] = Float32(0.0)  # has_left
+            else:
+                pd_split_col = None
+                pd_doc_k_end = None
+                pd_doc_k_start_tile = None
+                pd_doc_n_blocks = None
+                pd_deferred = None
+
             if const_expr(self.use_block_sparsity):
                 tile_block_count = get_total_block_count(blocksparse_tensors, batch_idx, head_idx, m_block)
                 has_work = tile_block_count > Int32(0)
@@ -1689,6 +1759,14 @@ class FlashAttentionForwardSm100:
                 seqlen=seqlen,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
+                mMaxScore=mMaxScore,
+                mBlockLSE=mBlockLSE,
+                mCuSeqlensQ=mCuSeqlensQ,
+                pd_split_col=pd_split_col,
+                pd_doc_k_end=pd_doc_k_end,
+                pd_doc_k_start_tile=pd_doc_k_start_tile,
+                pd_doc_n_blocks=pd_doc_n_blocks,
+                pd_deferred=pd_deferred,
             )
 
             if has_work:
@@ -1723,8 +1801,48 @@ class FlashAttentionForwardSm100:
                     self.mbar_P_full_2_offset,
                     self.q_stage,
                     Int32(stage),
+                    merged_order=True,
                 )
                 if not empty_tile:
+                    # Flush remaining deferred block scoring to GMEM
+                    if const_expr(self.per_doc_block_scoring and not self.pack_gqa):
+                        m_block_adj_bs = self.q_stage * m_block + stage
+                        valid_q_flush_bs = tidx < seqlen.seqlen_q - m_block_adj_bs * self.m_block_size
+                        if valid_q_flush_bs:
+                            if pd_deferred[6] > Float32(0.0):
+                                pd_flush_blk_bs = Int32(pd_deferred[4])
+                                if pd_flush_blk_bs >= 0 and pd_flush_blk_bs < pd_doc_n_blocks:
+                                    if const_expr(self.return_max_score):
+                                        if const_expr(not self.is_varlen_q):
+                                            gMC_fbs = cute.local_tile(mMaxScore[None, None, head_idx, batch_idx], (self.m_block_size, 1), (m_block_adj_bs, pd_flush_blk_bs))
+                                            gMC_fbs[tidx, 0] = pd_deferred[0]
+                                        else:
+                                            gMC_fbs = cute.local_tile(cute.domain_offset((head_idx, seqlen.offset_q, 0), mMaxScore), (1, self.m_block_size, 1), (0, m_block_adj_bs, pd_flush_blk_bs))
+                                            gMC_fbs[0, tidx, 0] = pd_deferred[0]
+                                    if cutlass.const_expr(self.return_block_lse):
+                                        if const_expr(not self.is_varlen_q):
+                                            gBL_fbs = cute.local_tile(mBlockLSE[None, None, head_idx, batch_idx], (self.m_block_size, 1), (m_block_adj_bs, pd_flush_blk_bs))
+                                            gBL_fbs[tidx, 0] = pd_deferred[2]
+                                        else:
+                                            gBL_fbs = cute.local_tile(cute.domain_offset((head_idx, seqlen.offset_q, 0), mBlockLSE), (1, self.m_block_size, 1), (0, m_block_adj_bs, pd_flush_blk_bs))
+                                            gBL_fbs[0, tidx, 0] = pd_deferred[2]
+                            if pd_deferred[7] > Float32(0.0):
+                                pd_flush_blk_l_bs = Int32(pd_deferred[5])
+                                if pd_flush_blk_l_bs >= 0 and pd_flush_blk_l_bs < pd_doc_n_blocks:
+                                    if const_expr(self.return_max_score):
+                                        if const_expr(not self.is_varlen_q):
+                                            gMC_fbs2 = cute.local_tile(mMaxScore[None, None, head_idx, batch_idx], (self.m_block_size, 1), (m_block_adj_bs, pd_flush_blk_l_bs))
+                                            gMC_fbs2[tidx, 0] = pd_deferred[1]
+                                        else:
+                                            gMC_fbs2 = cute.local_tile(cute.domain_offset((head_idx, seqlen.offset_q, 0), mMaxScore), (1, self.m_block_size, 1), (0, m_block_adj_bs, pd_flush_blk_l_bs))
+                                            gMC_fbs2[0, tidx, 0] = pd_deferred[1]
+                                    if cutlass.const_expr(self.return_block_lse):
+                                        if const_expr(not self.is_varlen_q):
+                                            gBL_fbs2 = cute.local_tile(mBlockLSE[None, None, head_idx, batch_idx], (self.m_block_size, 1), (m_block_adj_bs, pd_flush_blk_l_bs))
+                                            gBL_fbs2[tidx, 0] = pd_deferred[3]
+                                        else:
+                                            gBL_fbs2 = cute.local_tile(cute.domain_offset((head_idx, seqlen.offset_q, 0), mBlockLSE), (1, self.m_block_size, 1), (0, m_block_adj_bs, pd_flush_blk_l_bs))
+                                            gBL_fbs2[0, tidx, 0] = pd_deferred[3]
                     sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
                     if const_expr(mLSE is not None or learnable_sink is not None):
                         sScale[
@@ -1768,7 +1886,7 @@ class FlashAttentionForwardSm100:
                     )
                     for n_tile in cutlass.range(n_block_max - n_block_min_before_local_mask, unroll=1):
                         n_block = n_block_max - n_tile - 1
-                        if const_expr(self.mask_mod is not None):
+                        if const_expr(self.mask_mod is not None or self.is_arbitrary):
                             mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase = softmax_step(
                                 mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, n_block,
                                 mask_fn=partial(mask_fn, mask_seqlen=False),
@@ -1792,6 +1910,46 @@ class FlashAttentionForwardSm100:
                                 )
                             )
                             # Now that we no longer already have the 1st iteration, need mask_seqlen=True here
+
+                    # Flush remaining deferred block scoring to GMEM
+                    if const_expr(self.per_doc_block_scoring and not self.pack_gqa):
+                        m_block_adj = self.q_stage * m_block + stage
+                        valid_q_flush = tidx < seqlen.seqlen_q - m_block_adj * self.m_block_size
+                        if valid_q_flush:
+                            if pd_deferred[6] > Float32(0.0):
+                                pd_flush_blk = Int32(pd_deferred[4])
+                                if pd_flush_blk >= 0 and pd_flush_blk < pd_doc_n_blocks:
+                                    if const_expr(self.return_max_score):
+                                        if const_expr(not self.is_varlen_q):
+                                            gMC_flush = cute.local_tile(mMaxScore[None, None, head_idx, batch_idx], (self.m_block_size, 1), (m_block_adj, pd_flush_blk))
+                                            gMC_flush[tidx, 0] = pd_deferred[0]
+                                        else:
+                                            gMC_flush = cute.local_tile(cute.domain_offset((head_idx, seqlen.offset_q, 0), mMaxScore), (1, self.m_block_size, 1), (0, m_block_adj, pd_flush_blk))
+                                            gMC_flush[0, tidx, 0] = pd_deferred[0]
+                                    if cutlass.const_expr(self.return_block_lse):
+                                        if const_expr(not self.is_varlen_q):
+                                            gBL_flush = cute.local_tile(mBlockLSE[None, None, head_idx, batch_idx], (self.m_block_size, 1), (m_block_adj, pd_flush_blk))
+                                            gBL_flush[tidx, 0] = pd_deferred[2]
+                                        else:
+                                            gBL_flush = cute.local_tile(cute.domain_offset((head_idx, seqlen.offset_q, 0), mBlockLSE), (1, self.m_block_size, 1), (0, m_block_adj, pd_flush_blk))
+                                            gBL_flush[0, tidx, 0] = pd_deferred[2]
+                            if pd_deferred[7] > Float32(0.0):
+                                pd_flush_blk_l = Int32(pd_deferred[5])
+                                if pd_flush_blk_l >= 0 and pd_flush_blk_l < pd_doc_n_blocks:
+                                    if const_expr(self.return_max_score):
+                                        if const_expr(not self.is_varlen_q):
+                                            gMC_flush2 = cute.local_tile(mMaxScore[None, None, head_idx, batch_idx], (self.m_block_size, 1), (m_block_adj, pd_flush_blk_l))
+                                            gMC_flush2[tidx, 0] = pd_deferred[1]
+                                        else:
+                                            gMC_flush2 = cute.local_tile(cute.domain_offset((head_idx, seqlen.offset_q, 0), mMaxScore), (1, self.m_block_size, 1), (0, m_block_adj, pd_flush_blk_l))
+                                            gMC_flush2[0, tidx, 0] = pd_deferred[1]
+                                    if cutlass.const_expr(self.return_block_lse):
+                                        if const_expr(not self.is_varlen_q):
+                                            gBL_flush2 = cute.local_tile(mBlockLSE[None, None, head_idx, batch_idx], (self.m_block_size, 1), (m_block_adj, pd_flush_blk_l))
+                                            gBL_flush2[tidx, 0] = pd_deferred[3]
+                                        else:
+                                            gBL_flush2 = cute.local_tile(cute.domain_offset((head_idx, seqlen.offset_q, 0), mBlockLSE), (1, self.m_block_size, 1), (0, m_block_adj, pd_flush_blk_l))
+                                            gBL_flush2[0, tidx, 0] = pd_deferred[3]
 
                     # Dense path always writes scale / signals
                     sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
@@ -1850,6 +2008,14 @@ class FlashAttentionForwardSm100:
         seqlen,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
+        mMaxScore: Optional[cute.Tensor] = None,
+        mBlockLSE: Optional[cute.Tensor] = None,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
+        pd_split_col: Optional[Int32] = None,
+        pd_doc_k_end: Optional[Int32] = None,
+        pd_doc_k_start_tile: Optional[Int32] = None,
+        pd_doc_n_blocks: Optional[Int32] = None,
+        pd_deferred=None,
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
@@ -1893,19 +2059,55 @@ class FlashAttentionForwardSm100:
 
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block)
-        row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
+        if cutlass.const_expr(self.return_max_score):
+            if cutlass.const_expr(self.per_doc_block_scoring and not self.pack_gqa):
+                pd_tile_max = Float32(-Float32.inf)
+                pd_partial_max_left = Float32(-Float32.inf)
+                pd_partial_max_right = Float32(-Float32.inf)
+                res_s_pd = cute.make_fragment(tSrS_t2r.shape, Float32)
+                if pd_split_col == 0:
+                    pd_tile_max = utils.fmax_reduce(tSrS_t2r.load(), arch=self.arch)
+                    pd_partial_max_right = pd_tile_max
+                else:
+                    res_s_pd.store(tSrS_t2r.load())
+                    ncol_pd = const_expr(cute.size(res_s_pd.shape))
+                    for s in cutlass.range_constexpr(cute.ceil_div(ncol_pd, 24)):
+                        split_s = min(max(pd_split_col - s * 24, 0), 24)
+                        mask_left = (1 << split_s) - 1
+                        for i in cutlass.range_constexpr(min(24, ncol_pd - s * 24)):
+                            c = s * 24 + i
+                            is_left = cutlass.Boolean(mask_left & (1 << i))
+                            if is_left:
+                                pd_partial_max_left = utils.fmax(pd_partial_max_left, res_s_pd[c])
+                            else:
+                                pd_partial_max_right = utils.fmax(pd_partial_max_right, res_s_pd[c])
+                    pd_tile_max = utils.fmax(pd_partial_max_left, pd_partial_max_right)
+            else:
+                pd_tile_max = utils.fmax_reduce(tSrS_t2r.load(), arch=self.arch)
+            if const_expr(is_first):
+                row_max_new = pd_tile_max
+                row_max = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
+                acc_scale = 0.0
+            else:
+                row_max_old = softmax.row_max[0]
+                row_max_new = utils.fmax(pd_tile_max, row_max_old)
+                row_max = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
+                acc_scale_ = (row_max_old - row_max) * softmax.scale_log2
+                acc_scale = utils.exp2f(acc_scale_)
+                if cutlass.const_expr(softmax.rescale_threshold > 0.0):
+                    if acc_scale_ >= -softmax.rescale_threshold:
+                        row_max_new = row_max_old
+                        row_max = row_max_old
+                        acc_scale = 1.0
+            softmax.row_max[0] = row_max_new
+        else:
+            row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
 
         if const_expr(not is_first):
-            # tSrScale_r2t = cute.make_fragment(thr_tmem_store_scale.partition_S(tScScale).shape, Float32)
-            # tSrScale_r2t[0] = acc_scale
-            # cute.copy(thr_tmem_store_scale, tSrScale_r2t, tStScale_r2t)
-            # cute.arch.fence_view_async_tmem_store()
             thread_idx = thr_tmem_load.thr_idx
             sScale[thread_idx + stage * self.m_block_size] = acc_scale
-            # if thread_idx == 0: cute.printf("softmax acc_scale stage %d: %f, row_max = %f\n", stage, acc_scale, row_max)
         # Notify correction wg that row_max is ready
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
-
         # if thread_idx == 0 and stage == 0: cute.print_tensor(tSrS_t2r)
         # print(tSrS_t2r)
         softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
@@ -1944,10 +2146,131 @@ class FlashAttentionForwardSm100:
         cute.arch.fence_view_async_tmem_store()
         # Notify mma warp that the 2nd half of P is ready
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
+        # --- Phase 0: Write previous deferred to GMEM (write-only, overlaps with correction) ---
+        if cutlass.const_expr(self.per_doc_block_scoring and not self.pack_gqa):
+            pd_right_doc_block = n_block - pd_doc_k_start_tile
+            pd_left_doc_block = pd_right_doc_block - 1
+            thread_idx_pd = thr_tmem_load.thr_idx
+            valid_q_pd = thread_idx_pd < seqlen.seqlen_q - m_block * self.m_block_size
+            if valid_q_pd:
+                if pd_deferred[6] > Float32(0.0):
+                    pd_def_blk_r = Int32(pd_deferred[4])
+                    if pd_def_blk_r >= 0 and pd_def_blk_r < pd_doc_n_blocks:
+                        if const_expr(self.return_max_score):
+                            if const_expr(not self.is_varlen_q):
+                                gMC_def = cute.local_tile(mMaxScore[None, None, head_idx, batch_idx], (self.m_block_size, 1), (m_block, pd_def_blk_r))
+                                gMC_def[thread_idx_pd, 0] = pd_deferred[0]
+                            else:
+                                gMC_def = cute.local_tile(cute.domain_offset((head_idx, seqlen.offset_q, 0), mMaxScore), (1, self.m_block_size, 1), (0, m_block, pd_def_blk_r))
+                                gMC_def[0, thread_idx_pd, 0] = pd_deferred[0]
+                        if cutlass.const_expr(self.return_block_lse):
+                            if const_expr(not self.is_varlen_q):
+                                gBL_def = cute.local_tile(mBlockLSE[None, None, head_idx, batch_idx], (self.m_block_size, 1), (m_block, pd_def_blk_r))
+                                gBL_def[thread_idx_pd, 0] = pd_deferred[2]
+                            else:
+                                gBL_def = cute.local_tile(cute.domain_offset((head_idx, seqlen.offset_q, 0), mBlockLSE), (1, self.m_block_size, 1), (0, m_block, pd_def_blk_r))
+                                gBL_def[0, thread_idx_pd, 0] = pd_deferred[2]
+                if pd_deferred[7] > Float32(0.0):
+                    pd_def_blk_l = Int32(pd_deferred[5])
+                    if pd_def_blk_l != pd_right_doc_block:
+                        if pd_def_blk_l >= 0 and pd_def_blk_l < pd_doc_n_blocks:
+                            if const_expr(self.return_max_score):
+                                if const_expr(not self.is_varlen_q):
+                                    gMC_def2 = cute.local_tile(mMaxScore[None, None, head_idx, batch_idx], (self.m_block_size, 1), (m_block, pd_def_blk_l))
+                                    gMC_def2[thread_idx_pd, 0] = pd_deferred[1]
+                                else:
+                                    gMC_def2 = cute.local_tile(cute.domain_offset((head_idx, seqlen.offset_q, 0), mMaxScore), (1, self.m_block_size, 1), (0, m_block, pd_def_blk_l))
+                                    gMC_def2[0, thread_idx_pd, 0] = pd_deferred[1]
+                            if cutlass.const_expr(self.return_block_lse):
+                                if const_expr(not self.is_varlen_q):
+                                    gBL_def2 = cute.local_tile(mBlockLSE[None, None, head_idx, batch_idx], (self.m_block_size, 1), (m_block, pd_def_blk_l))
+                                    gBL_def2[thread_idx_pd, 0] = pd_deferred[3]
+                                else:
+                                    gBL_def2 = cute.local_tile(cute.domain_offset((head_idx, seqlen.offset_q, 0), mBlockLSE), (1, self.m_block_size, 1), (0, m_block, pd_def_blk_l))
+                                    gBL_def2[0, thread_idx_pd, 0] = pd_deferred[3]
+                        pd_deferred[7] = Float32(0.0)
+        # --- Phase 1: TMEM reads + register computation (overlaps with correction warp) ---
+        if cutlass.const_expr(self.return_block_lse):
+            if cutlass.const_expr(self.per_doc_block_scoring and not self.pack_gqa):
+                pd_tile_sum = Float32(0.0)
+                pd_partial_sum_left = Float32(0.0)
+                pd_partial_sum_right = Float32(0.0)
+                if pd_split_col == 0:
+                    pd_tile_sum = utils.fadd_reduce(tSrS_t2r.load(), arch=self.arch)
+                    pd_partial_sum_right = pd_tile_sum
+                else:
+                    res_s_pd.store(tSrS_t2r.load())
+                    ncol_pd2 = const_expr(cute.size(res_s_pd.shape))
+                    for s in cutlass.range_constexpr(cute.ceil_div(ncol_pd2, 24)):
+                        split_s2 = min(max(pd_split_col - s * 24, 0), 24)
+                        mask_left2 = (1 << split_s2) - 1
+                        for i in cutlass.range_constexpr(min(24, ncol_pd2 - s * 24)):
+                            c = s * 24 + i
+                            is_left2 = cutlass.Boolean(mask_left2 & (1 << i))
+                            if is_left2:
+                                pd_partial_sum_left = pd_partial_sum_left + res_s_pd[c]
+                            else:
+                                pd_partial_sum_right = pd_partial_sum_right + res_s_pd[c]
+                    pd_tile_sum = pd_partial_sum_left + pd_partial_sum_right
+            else:
+                pd_tile_sum = utils.fadd_reduce(tSrS_t2r.load(), arch=self.arch)
+            if const_expr(is_first):
+                softmax.row_sum[0] = pd_tile_sum
+            else:
+                softmax.row_sum[0] = pd_tile_sum + softmax.row_sum[0] * acc_scale
+            if cutlass.const_expr(self.per_doc_block_scoring and not self.pack_gqa):
+                LN2_pd = math.log(2.0)
+                LOG2E_pd = Float32(1.0 / math.log(2.0))
+                pd_lse_right = -Float32.inf
+                pd_lse_left = -Float32.inf
+                if valid_q_pd:
+                    pd_lse_right = (
+                        (row_max * softmax.scale_log2 + utils.log2f(pd_partial_sum_right)) * LN2_pd
+                        if pd_partial_sum_right > Float32(0.0)
+                        else -Float32.inf
+                    )
+                    pd_lse_left = (
+                        (row_max * softmax.scale_log2 + utils.log2f(pd_partial_sum_left)) * LN2_pd
+                        if pd_partial_sum_left > Float32(0.0)
+                        else -Float32.inf
+                    )
+        else:
+            softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
+        # --- Phase 1.5: Merge deferred left with current right, save to deferred ---
+        if cutlass.const_expr(self.per_doc_block_scoring and not self.pack_gqa):
+            if pd_deferred[7] > Float32(0.0):
+                if const_expr(self.return_max_score):
+                    pd_partial_max_right = utils.fmax(pd_deferred[1], pd_partial_max_right)
+                if cutlass.const_expr(self.return_block_lse):
+                    pd_def_lse_l = pd_deferred[3]
+                    if pd_def_lse_l > -Float32.inf and pd_lse_right > -Float32.inf:
+                        pd_merge_m = utils.fmax(pd_def_lse_l, pd_lse_right)
+                        pd_lse_right = (
+                            pd_merge_m + LN2_pd * utils.log2f(
+                                utils.exp2f((pd_def_lse_l - pd_merge_m) * LOG2E_pd)
+                                + utils.exp2f((pd_lse_right - pd_merge_m) * LOG2E_pd)
+                            )
+                        )
+                    elif pd_def_lse_l > -Float32.inf:
+                        pd_lse_right = pd_def_lse_l
+                pd_deferred[7] = Float32(0.0)
+            if const_expr(self.return_max_score):
+                pd_deferred[0] = pd_partial_max_right
+            if cutlass.const_expr(self.return_block_lse):
+                pd_deferred[2] = pd_lse_right
+            pd_deferred[4] = Float32(pd_right_doc_block)
+            pd_deferred[6] = Float32(1.0)
+            if pd_split_col != 0:
+                if const_expr(self.return_max_score):
+                    pd_deferred[1] = pd_partial_max_left
+                if cutlass.const_expr(self.return_block_lse):
+                    pd_deferred[3] = pd_lse_left
+                pd_deferred[5] = Float32(pd_left_doc_block)
+                pd_deferred[7] = Float32(1.0)
+        # --- Phase 2: Wait for correction warp ---
         cute.arch.mbarrier_wait(
             mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase
         )
-        softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
         # acc_scale = cute.arch.exp2(acc_scale_)
         return mma_si_consumer_phase ^ 1, si_corr_producer_phase ^ 1, s0_s1_sequence_phase ^ 1
 
@@ -1972,6 +2295,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[LinearBlockSparseTensors] = None,
+        mMaxScore: Optional[cute.Tensor] = None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
@@ -2022,6 +2346,7 @@ class FlashAttentionForwardSm100:
                 has_work = const_expr(not self.is_split_kv) or total_block_count > Int32(0)
 
             if has_work:
+
                 # Ignore first signal from softmax as no correction is required
                 cute.arch.mbarrier_wait(
                     mbar_ptr + self.mbar_softmax_corr_full_offset + 0, softmax_corr_consumer_phase
@@ -2040,16 +2365,8 @@ class FlashAttentionForwardSm100:
                             mbar_ptr + self.mbar_softmax_corr_full_offset + stage,
                             softmax_corr_consumer_phase,
                         )
-                        # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
-                        # cute.arch.fence_view_async_tmem_load()
-                        # scale = tSrScale_t2r[0]
                         scale = sScale[tidx + stage * self.m_block_size]
                         should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
-                        # should_rescale = True
-                        # if tidx == 0: cute.printf("Correction scale i = %d, for stage %d: %f, should_rescale = %d\n", i, stage, scale, should_rescale)
-                        # Don't need O_full anymore, since by the time softmax has signaled the correction
-                        # warps, S_i must have been done, so O_i-1 must have been done as well.
-                        # cute.arch.mbarrier_wait(mbar_ptr + self.mbar_O_full_offset + stage, o_corr_consumer_phase)
                         if should_rescale:
                             self.correction_rescale(
                                 thr_mma_pv, tOtOs[stage if self.q_stage == 2 else 0], tidx, scale
@@ -2059,7 +2376,6 @@ class FlashAttentionForwardSm100:
                             mbar_ptr + self.mbar_softmax_corr_empty_offset + (1 - stage)
                         )
                     softmax_corr_consumer_phase ^= 1
-                    # o_corr_consumer_phase ^= 1
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_empty_offset + 1)
                 # End of seqlen_corr_loop_steps
 
@@ -2369,10 +2685,7 @@ class FlashAttentionForwardSm100:
             tOrO_frg_cvt.store(tOrO_frg.load().to(self.o_dtype))
             cute.copy(tiled_smem_store, tOrO_frg_cvt, tOsO_r2s_i)
         # fence view async shared
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
-        )
+        cute.arch.fence_view_async_shared()
 
         if const_expr(self.use_correction_warps_for_epi):
             assert(not self.use_tma_O)
