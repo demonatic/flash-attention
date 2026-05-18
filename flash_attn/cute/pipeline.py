@@ -227,21 +227,26 @@ class PipelineTmaAsync(PipelineTmaAsyncOg):
         state: PipelineState,
         try_acquire_token: Optional[Boolean] = None,
         extra_tx_count: int = 0,
+        *,
+        loc=None,
+        ip=None,
     ):
         """
         TMA producer commit conditionally waits on buffer empty and sets the transaction barrier for leader threadblocks.
         """
         if_generate(
             try_acquire_token is None or try_acquire_token == 0,
-            lambda: self.sync_object_empty.wait(state.index, state.phase),
+            lambda: self.sync_object_empty.wait(state.index, state.phase, loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
         )
         if const_expr(extra_tx_count == 0):
-            self.sync_object_full.arrive(state.index, self.producer_mask)
+            self.sync_object_full.arrive(state.index, self.producer_mask, loc=loc, ip=ip)
         else:
             tx_count = self.sync_object_full.tx_count + extra_tx_count
-            self.sync_object_full.arrive_and_expect_tx(state.index, tx_count)
+            self.sync_object_full.arrive_and_expect_tx(state.index, tx_count, loc=loc, ip=ip)
 
-    def consumer_release(self, state: PipelineState):
+    def consumer_release(self, state: PipelineState, *, loc=None, ip=None):
         """
         TMA consumer release conditionally signals the empty buffer to the producer.
         """
@@ -249,12 +254,20 @@ class PipelineTmaAsync(PipelineTmaAsyncOg):
         if self.consumer_mask is None:  # No cluster, 1 thread per warp group to signal
             if_generate(
                 cute.arch.thread_idx()[0] % 128 == 0,
-                lambda: self.sync_object_empty.arrive(state.index, self.consumer_mask),
+                lambda: self.sync_object_empty.arrive(
+                    state.index, self.consumer_mask, loc=loc, ip=ip
+                ),
+                loc=loc,
+                ip=ip,
             )
         else:
             if_generate(
                 self.is_signalling_thread,
-                lambda: self.sync_object_empty.arrive(state.index, self.consumer_mask),
+                lambda: self.sync_object_empty.arrive(
+                    state.index, self.consumer_mask, loc=loc, ip=ip
+                ),
+                loc=loc,
+                ip=ip,
             )
 
 
@@ -300,10 +313,10 @@ class PipelineTmaUmma(PipelineTmaUmmaOg):
         producer = (producer_type, producer_group)
         consumer = (consumer_type, consumer_group)
 
-        sync_object_full = PipelineAsync._make_sync_object(
+        sync_object_full = PipelineTmaUmmaOg._make_sync_object(
             barrier_storage.align(min_align=8), num_stages, producer, tx_count
         )
-        sync_object_empty = PipelineAsync._make_sync_object(
+        sync_object_empty = PipelineTmaUmmaOg._make_sync_object(
             barrier_storage.align(min_align=8) + num_stages, num_stages, consumer
         )
 
@@ -344,22 +357,35 @@ class PipelineTmaUmma(PipelineTmaUmmaOg):
         state: PipelineState,
         try_acquire_token: Optional[Boolean] = None,
         extra_tx_count: int = 0,
+        *,
+        loc=None,
+        ip=None,
     ):
         """
         TMA producer commit conditionally waits on buffer empty and sets the transaction barrier for leader threadblocks.
         """
         if_generate(
             try_acquire_token is None or try_acquire_token == 0,
-            lambda: self.sync_object_empty.wait(state.index, state.phase),
+            lambda: self.sync_object_empty.wait(state.index, state.phase, loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
         )
         if const_expr(extra_tx_count == 0):
             if_generate(
                 self.is_leader_cta,
-                lambda: self.sync_object_full.arrive(state.index, self.producer_mask),
+                lambda: self.sync_object_full.arrive(
+                    state.index, self.producer_mask, loc=loc, ip=ip
+                ),
+                loc=loc,
+                ip=ip,
             )
         else:
             tx_count = self.sync_object_full.tx_count + extra_tx_count
             if_generate(
                 self.is_leader_cta,
-                lambda: self.sync_object_full.arrive_and_expect_tx(state.index, tx_count),
+                lambda: self.sync_object_full.arrive_and_expect_tx(
+                    state.index, tx_count, loc=loc, ip=ip
+                ),
+                loc=loc,
+                ip=ip,
             )

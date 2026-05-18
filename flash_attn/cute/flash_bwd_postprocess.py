@@ -172,11 +172,7 @@ class FlashAttentionBackwardPostprocess:
         gmem_k_block_size = (
             128
             if self.tile_hdim % 128 == 0
-            else (
-                64
-                if self.tile_hdim % 64 == 0
-                else (32 if self.tile_hdim % 32 == 0 else 16)
-            )
+            else (64 if self.tile_hdim % 64 == 0 else (32 if self.tile_hdim % 32 == 0 else 16))
         )
         self.gmem_tiled_copy_dQ = copy_utils.tiled_copy_2d(
             self.dtype, gmem_k_block_size, self.num_threads
@@ -690,9 +686,7 @@ class FlashAttentionBackwardPostprocess_sm100(FlashAttentionBackwardPostprocess)
 
             cute.copy(smem_thr_copy_g2s, tdQgdQ[None, None, 0], tdQsdQ[None, None, 0])
 
-            cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-            )
+            cute.arch.fence_view_async_shared()
             cute.arch.barrier(barrier_id=6, number_of_threads=num_reduce_threads)
 
             # S -> R
@@ -704,9 +698,7 @@ class FlashAttentionBackwardPostprocess_sm100(FlashAttentionBackwardPostprocess)
 
             cute.copy(s2r_thr_copy_dQaccum, tdQsdQ_s2r_p, tdQrdQ_r2s_cpy)
 
-            cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-            )
+            cute.arch.fence_view_async_shared()
             cute.arch.barrier(barrier_id=7, number_of_threads=num_reduce_threads)
 
             # R->S
@@ -722,9 +714,7 @@ class FlashAttentionBackwardPostprocess_sm100(FlashAttentionBackwardPostprocess)
             tdQrdQ_r2s[None, None, None, None, 0],
             tdQsdQ_r2s[None, None, None, None, 0],
         )
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-        )
+        cute.arch.fence_view_async_shared()
         cute.arch.barrier(barrier_id=8, number_of_threads=num_reduce_threads)
 
         # S-> G

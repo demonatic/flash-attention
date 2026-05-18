@@ -9,9 +9,11 @@ here = Path(__file__).resolve().parent
 readme_path = here / "README.md"
 long_description = readme_path.read_text(encoding="utf-8") if readme_path.exists() else ""
 
+flash_attn_cute_version = "0.0.2"  # Update this version as needed
+
 setup(
     name="flash_attn_cute",
-    version="0.0.1",
+    version=flash_attn_cute_version,
     description="A monkey-patch flash attention 4 package supporting arbitary mask for magi_attention.",
     long_description=long_description,
     long_description_content_type="text/markdown",

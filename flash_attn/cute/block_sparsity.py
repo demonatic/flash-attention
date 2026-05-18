@@ -52,24 +52,44 @@ class LinearBlockSparseTensors(NamedTuple):
 
 
 class LinearBlockSparseTensorsTorch(NamedTuple):
-    mask_block_cnt: torch.Tensor # (n_blocks_q)
-    mask_block_offset: torch.Tensor # (n_blocks_q + 1)
-    mask_block_idx: torch.Tensor # (O(n_blocks_q))
-    full_block_cnt: Optional[torch.Tensor] = None # (n_blocks_q)
-    full_block_offset: Optional[torch.Tensor] = None # (n_blocks_q + 1)
-    full_block_idx: Optional[torch.Tensor] = None # (O(n_blocks_q))
+    mask_block_cnt: torch.Tensor  # (n_blocks_q)
+    mask_block_offset: torch.Tensor  # (n_blocks_q + 1)
+    mask_block_idx: torch.Tensor  # (O(n_blocks_q))
+    full_block_cnt: Optional[torch.Tensor] = None  # (n_blocks_q)
+    full_block_offset: Optional[torch.Tensor] = None  # (n_blocks_q + 1)
+    full_block_idx: Optional[torch.Tensor] = None  # (O(n_blocks_q))
 
 
-def bhqk_to_linear_sparse_tensors(bhqk_tensors: BlockSparseTensorsTorch) -> LinearBlockSparseTensorsTorch:
+def bhqk_to_linear_sparse_tensors(
+    bhqk_tensors: BlockSparseTensorsTorch,
+) -> LinearBlockSparseTensorsTorch:
     mask_block_cnt = bhqk_tensors.mask_block_cnt.flatten()
     n_blocks_q = mask_block_cnt.shape[0]
-    mask_block_offset = torch.cat([torch.zeros(1, device=bhqk_tensors.mask_block_cnt.device, dtype=torch.int32), torch.cumsum(mask_block_cnt, dim=0)], dim=0)
+    mask_block_offset = torch.cat(
+        [
+            torch.zeros(1, device=bhqk_tensors.mask_block_cnt.device, dtype=torch.int32),
+            torch.cumsum(mask_block_cnt, dim=0),
+        ],
+        dim=0,
+    )
     mask_block_idx = []
     for i in range(n_blocks_q):
         mask_block_idx.append(bhqk_tensors.mask_block_idx[0, 0, i, : mask_block_cnt[i].item()])
     mask_block_idx = torch.cat(mask_block_idx, dim=0)
-    full_block_cnt = bhqk_tensors.full_block_cnt.flatten() if bhqk_tensors.full_block_cnt is not None else None
-    full_block_offset = torch.cat([torch.zeros(1, device=bhqk_tensors.full_block_cnt.device, dtype=torch.int32), torch.cumsum(full_block_cnt, dim=0)], dim=0) if full_block_cnt is not None else None
+    full_block_cnt = (
+        bhqk_tensors.full_block_cnt.flatten() if bhqk_tensors.full_block_cnt is not None else None
+    )
+    full_block_offset = (
+        torch.cat(
+            [
+                torch.zeros(1, device=bhqk_tensors.full_block_cnt.device, dtype=torch.int32),
+                torch.cumsum(full_block_cnt, dim=0),
+            ],
+            dim=0,
+        )
+        if full_block_cnt is not None
+        else None
+    )
     if bhqk_tensors.full_block_idx is not None:
         full_block_idx = []
         for i in range(n_blocks_q):
@@ -85,6 +105,7 @@ def bhqk_to_linear_sparse_tensors(bhqk_tensors: BlockSparseTensorsTorch) -> Line
         full_block_offset=full_block_offset,
         full_block_idx=full_block_idx,
     )
+
 
 def _expand_sparsity_tensor(
     tensor: torch.Tensor,
@@ -179,16 +200,16 @@ def to_cute_block_sparse_tensors(tensors: BlockSparseTensorsTorch) -> Optional[B
         tensors.mask_block_idx.detach(), assumed_align=4, enable_tvm_ffi=True
     ).mark_layout_dynamic(leading_dim=3)
     full_block_cnt_tensor = (
-        from_dlpack(tensors.full_block_cnt.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
-            leading_dim=2
-        )
+        from_dlpack(
+            tensors.full_block_cnt.detach(), assumed_align=4, enable_tvm_ffi=True
+        ).mark_layout_dynamic(leading_dim=2)
         if tensors.full_block_cnt is not None
         else None
     )
     full_block_idx_tensor = (
-        from_dlpack(tensors.full_block_idx.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
-            leading_dim=3
-        )
+        from_dlpack(
+            tensors.full_block_idx.detach(), assumed_align=4, enable_tvm_ffi=True
+        ).mark_layout_dynamic(leading_dim=3)
         if tensors.full_block_idx is not None
         else None
     )
@@ -200,7 +221,10 @@ def to_cute_block_sparse_tensors(tensors: BlockSparseTensorsTorch) -> Optional[B
         full_block_idx_tensor,
     )
 
-def to_torch_linear_block_sparse_tensors(tensors: LinearBlockSparseTensors) -> Optional[LinearBlockSparseTensorsTorch]:
+
+def to_torch_linear_block_sparse_tensors(
+    tensors: LinearBlockSparseTensors,
+) -> Optional[LinearBlockSparseTensorsTorch]:
     if not is_block_sparsity_enabled(tensors):
         return None
 
@@ -214,7 +238,9 @@ def to_torch_linear_block_sparse_tensors(tensors: LinearBlockSparseTensors) -> O
     )
 
 
-def to_cute_linear_block_sparse_tensors(tensors: LinearBlockSparseTensorsTorch) -> Optional[LinearBlockSparseTensors]:
+def to_cute_linear_block_sparse_tensors(
+    tensors: LinearBlockSparseTensorsTorch,
+) -> Optional[LinearBlockSparseTensors]:
     if not is_block_sparsity_enabled(tensors):
         return None
 
@@ -228,9 +254,9 @@ def to_cute_linear_block_sparse_tensors(tensors: LinearBlockSparseTensorsTorch) 
         tensors.mask_block_idx.detach(), assumed_align=4, enable_tvm_ffi=True
     ).mark_layout_dynamic(leading_dim=0)
     full_block_cnt_tensor = (
-        from_dlpack(tensors.full_block_cnt.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
-            leading_dim=0
-        )
+        from_dlpack(
+            tensors.full_block_cnt.detach(), assumed_align=4, enable_tvm_ffi=True
+        ).mark_layout_dynamic(leading_dim=0)
         if tensors.full_block_cnt is not None
         else None
     )
@@ -242,9 +268,9 @@ def to_cute_linear_block_sparse_tensors(tensors: LinearBlockSparseTensorsTorch) 
         else None
     )
     full_block_idx_tensor = (
-        from_dlpack(tensors.full_block_idx.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
-            leading_dim=0
-        )
+        from_dlpack(
+            tensors.full_block_idx.detach(), assumed_align=4, enable_tvm_ffi=True
+        ).mark_layout_dynamic(leading_dim=0)
         if tensors.full_block_idx is not None
         else None
     )
