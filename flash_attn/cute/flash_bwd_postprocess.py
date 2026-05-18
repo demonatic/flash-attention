@@ -172,11 +172,7 @@ class FlashAttentionBackwardPostprocess:
         gmem_k_block_size = (
             128
             if self.tile_hdim % 128 == 0
-            else (
-                64
-                if self.tile_hdim % 64 == 0
-                else (32 if self.tile_hdim % 32 == 0 else 16)
-            )
+            else (64 if self.tile_hdim % 64 == 0 else (32 if self.tile_hdim % 32 == 0 else 16))
         )
         self.gmem_tiled_copy_dQ = copy_utils.tiled_copy_2d(
             self.dtype, gmem_k_block_size, self.num_threads

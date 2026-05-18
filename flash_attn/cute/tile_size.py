@@ -32,6 +32,7 @@ _CPP_IMPORT_WARNING_SHOWN = False
 
 try:
     import create_block_mask_cuda
+
     _USE_CPP_TILE_SIZES = True
 except ImportError:
     pass
@@ -47,7 +48,7 @@ def _warn_cpp_not_available():
             "To use the single source of truth (hopper/tile_size.h), install the extension:\n"
             "  cd csrc/utils/create_block_mask && pip install -e .",
             UserWarning,
-            stacklevel=3
+            stacklevel=3,
         )
         _CPP_IMPORT_WARNING_SHOWN = True
 
@@ -263,9 +264,11 @@ def get_fwd_tile_sizes(
 
     # Use C++ extension if available (calls hopper/tile_size.h - single source of truth)
     if _USE_CPP_TILE_SIZES:
-        return tuple(create_block_mask_cuda.get_fwd_tile_sizes(
-            headdim, is_causal, is_local, is_arbitrary, arch
-        ))
+        return tuple(
+            create_block_mask_cuda.get_fwd_tile_sizes(
+                headdim, is_causal, is_local, is_arbitrary, arch
+            )
+        )
 
     # Python fallback (may be stale if C++ code changes)
     _warn_cpp_not_available()
@@ -407,9 +410,11 @@ def get_bwd_tile_sizes(
 
     # Use C++ extension if available (calls hopper/tile_size.h - single source of truth)
     if _USE_CPP_TILE_SIZES:
-        return tuple(create_block_mask_cuda.get_bwd_tile_sizes(
-            headdim, is_causal, is_local, is_arbitrary, has_softcap, arch
-        ))
+        return tuple(
+            create_block_mask_cuda.get_bwd_tile_sizes(
+                headdim, is_causal, is_local, is_arbitrary, has_softcap, arch
+            )
+        )
 
     # Python fallback (may be stale if C++ code changes)
     _warn_cpp_not_available()
@@ -473,6 +478,7 @@ def validate_tile_sizes(
 # DSL Forward:  (128, 128) for all configurations with block sparsity
 # DSL Backward: (64, 128) for SM90 with arbitrary, (128, 128) for SM100
 # =============================================================================
+
 
 def get_fwd_tile_sizes_dsl(
     arch: int = None,
@@ -600,11 +606,18 @@ def get_tile_sizes_by_backend(
         # C++ backend (hopper): variable tile sizes from tile_size.h
         if pass_type == "forward":
             return get_fwd_tile_sizes(
-                arch=arch, headdim=headdim, is_causal=is_causal,
-                is_local=is_local, is_arbitrary=is_arbitrary
+                arch=arch,
+                headdim=headdim,
+                is_causal=is_causal,
+                is_local=is_local,
+                is_arbitrary=is_arbitrary,
             )
         else:
             return get_bwd_tile_sizes(
-                arch=arch, headdim=headdim, is_causal=is_causal,
-                is_local=is_local, is_arbitrary=is_arbitrary, has_softcap=has_softcap
+                arch=arch,
+                headdim=headdim,
+                is_causal=is_causal,
+                is_local=is_local,
+                is_arbitrary=is_arbitrary,
+                has_softcap=has_softcap,
             )

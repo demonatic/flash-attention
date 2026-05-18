@@ -61,12 +61,15 @@ def flex_mini_causal_mask(b, h, q_idx, kv_idx):
 def flex_document_mask(b, h, q_idx, kv_idx, doc_id):
     return doc_id[b, h, q_idx] == doc_id[b, h, kv_idx]
 
+
 def flex_arbitrary_mask(b, h, q_idx, kv_idx, arbitrary_func):
     zero = h * 0
     value_valid = kv_idx < arbitrary_func[b, zero, zero, q_idx]
     n_func = arbitrary_func.shape[2]
     for i in range(n_func // 2):
-        in_range = (kv_idx >= arbitrary_func[b, zero, zero + (2*i+1), q_idx]) & (kv_idx < arbitrary_func[b, zero, zero + (2*i+2), q_idx])
+        in_range = (kv_idx >= arbitrary_func[b, zero, zero + (2 * i + 1), q_idx]) & (
+            kv_idx < arbitrary_func[b, zero, zero + (2 * i + 2), q_idx]
+        )
         value_valid = value_valid | in_range
     return value_valid
 
@@ -135,6 +138,7 @@ def cute_document_mask(
     n_doc = utils.scalar_to_ssa(doc_id[batch[0], head[0], n_idx[0]], cutlass.Int32)
     return m_doc == n_doc
 
+
 @cute.jit
 def cute_arbitrary_mask(
     batch: cute.TensorSSA,
@@ -149,7 +153,10 @@ def cute_arbitrary_mask(
         value_valid = True
     n_func = arbitrary_func.shape[2]
     for i in range(n_func // 2):
-        if n_idx[0] >= arbitrary_func[batch[0], 0, 2 * i + 1, m_idx[0]] and n_idx[0] < arbitrary_func[batch[0], 0, 2 * i + 2, m_idx[0]]:
+        if (
+            n_idx[0] >= arbitrary_func[batch[0], 0, 2 * i + 1, m_idx[0]]
+            and n_idx[0] < arbitrary_func[batch[0], 0, 2 * i + 2, m_idx[0]]
+        ):
             value_valid = True
     return utils.scalar_to_ssa(value_valid, cutlass.Boolean)
 
@@ -263,10 +270,13 @@ def random_doc_id_tensor(nheads, batch, seqlen_q, device="cpu"):
             doc_ids_tensor[b, h, :] = torch.tensor(doc_ids, dtype=torch.int32, device=device)
     return doc_ids_tensor
 
-def random_arbitrary_func_tensor(nheads, batch, n_func, seqlen_q, seqlen_k, device="cpu", pattern="causal"):
+
+def random_arbitrary_func_tensor(
+    nheads, batch, n_func, seqlen_q, seqlen_k, device="cpu", pattern="causal"
+):
     """
     Generate arbitrary function tensor for mask computation.
-    
+
     Args:
         nheads: Number of attention heads
         batch: Batch size
@@ -275,12 +285,14 @@ def random_arbitrary_func_tensor(nheads, batch, n_func, seqlen_q, seqlen_k, devi
         seqlen_k: Key sequence length
         device: Device to create tensor on
         pattern: Pattern type - "random" or "causal"
-    
+
     Returns:
         arbitrary_func_tensor: [batch, nheads, n_func, seqlen_q + 256]
     """
-    arbitrary_func_tensor = torch.zeros(batch, nheads, n_func, seqlen_q + 256, dtype=torch.int32, device=device)
-    
+    arbitrary_func_tensor = torch.zeros(
+        batch, nheads, n_func, seqlen_q + 256, dtype=torch.int32, device=device
+    )
+
     if pattern == "random":
         # Random pattern: each function defines a random interval
         coef = 1 / n_func
@@ -289,18 +301,25 @@ def random_arbitrary_func_tensor(nheads, batch, n_func, seqlen_q, seqlen_k, devi
             high = int((i + 1) * coef * seqlen_k)
             if high <= low:
                 high = low + 1
-            arbitrary_func_tensor[:, :, i, :seqlen_q] = torch.randint(low, high, size=(batch, nheads, seqlen_q), device=device)
+            arbitrary_func_tensor[:, :, i, :seqlen_q] = torch.randint(
+                low, high, size=(batch, nheads, seqlen_q), device=device
+            )
     elif pattern == "causal":
         # Causal mask pattern: each q_idx can only attend to kv_idx < q_idx + 1
         # Only use the first function (n_func=1 is expected for causal)
         q_indices = torch.arange(seqlen_q, device=device, dtype=torch.int32)
-        causal_values = torch.minimum(q_indices + 1, torch.tensor(seqlen_k, device=device, dtype=torch.int32))
+        causal_values = torch.minimum(
+            q_indices + 1, torch.tensor(seqlen_k, device=device, dtype=torch.int32)
+        )
         # Broadcast to all batch and heads
-        arbitrary_func_tensor[:, :, 0, :seqlen_q] = causal_values.unsqueeze(0).unsqueeze(0).expand(batch, nheads, -1)
+        arbitrary_func_tensor[:, :, 0, :seqlen_q] = (
+            causal_values.unsqueeze(0).unsqueeze(0).expand(batch, nheads, -1)
+        )
     else:
         raise ValueError(f"Unknown pattern: {pattern}. Supported patterns: 'random', 'causal'")
-    
+
     return arbitrary_func_tensor
+
 
 STATIC_MASKS = {
     "block_diagonal": (cute_block_diagonal_mask, flex_block_diagonal_mask),

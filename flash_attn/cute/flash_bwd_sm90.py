@@ -628,7 +628,14 @@ class FlashAttentionBackwardSm90:
                         barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
                         number_of_threads=self.num_threads_per_warp_group + cute.arch.WARP_SIZE,
                     )
-                self.dQaccum_store(mdQaccum, sdQaccum, block_info, TileSchedulerCls, SeqlenInfoCls, blocksparse_tensors)
+                self.dQaccum_store(
+                    mdQaccum,
+                    sdQaccum,
+                    block_info,
+                    TileSchedulerCls,
+                    SeqlenInfoCls,
+                    blocksparse_tensors,
+                )
         else:
             # cute.arch.warpgroup_reg_alloc(self.num_mma_regs)
             tidx, _, _ = cute.arch.thread_idx()
@@ -1010,7 +1017,14 @@ class FlashAttentionBackwardSm90:
                     )
                     dKV_accumulate = True
             else:
-                mask_block_cnt, mask_block_offset, mask_block_idx, full_block_cnt, full_block_offset, full_block_idx = blocksparse_tensors
+                (
+                    mask_block_cnt,
+                    mask_block_offset,
+                    mask_block_idx,
+                    full_block_cnt,
+                    full_block_offset,
+                    full_block_idx,
+                ) = blocksparse_tensors
                 curr_mask_block_cnt = mask_block_cnt[n_block]
                 curr_mask_block_offset = mask_block_offset[n_block]
                 curr_mask_block_idx = mask_block_idx
@@ -1314,7 +1328,8 @@ class FlashAttentionBackwardSm90:
             gdQaccum = cute.flat_divide(
                 gdQaccum_, (self.tile_m * self.tile_hdim // self.num_mma_warp_groups,)
             )
-            dQaccum_step_fn = partial(self.dQaccum_step,
+            dQaccum_step_fn = partial(
+                self.dQaccum_step,
                 gdQaccum=gdQaccum,
                 sdQaccum=sdQaccum,
             )
@@ -1323,7 +1338,14 @@ class FlashAttentionBackwardSm90:
                 for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
                     dQaccum_step_fn(m_block=m_block)
             else:
-                mask_block_cnt, mask_block_offset, mask_block_idx, full_block_cnt, full_block_offset, full_block_idx = blocksparse_tensors
+                (
+                    mask_block_cnt,
+                    mask_block_offset,
+                    mask_block_idx,
+                    full_block_cnt,
+                    full_block_offset,
+                    full_block_idx,
+                ) = blocksparse_tensors
                 curr_mask_block_cnt = mask_block_cnt[n_block]
                 curr_mask_block_offset = mask_block_offset[n_block]
                 curr_mask_block_idx = mask_block_idx
@@ -1345,7 +1367,6 @@ class FlashAttentionBackwardSm90:
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
-
 
     @cute.jit
     def dQaccum_step(

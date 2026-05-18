@@ -25,7 +25,6 @@ from flash_attn_cute.block_sparse_utils import (
     get_total_block_count,
     produce_block_sparse_loads_bwd_sm100,
     compute_block_sparse_bwd_sm100,
-    reduce_block_sparse_bwd_sm100,
     get_block_sparse_iteration_info_bwd,
     get_m_block_from_iter_bwd,
 )
@@ -1373,30 +1372,37 @@ class FlashAttentionBackwardSm100:
                             copy_stats(
                                 gdPsum[None, m_block],
                                 sdPsum[None, producer_state_dO_dPsum.index],
-                                mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
+                                mbar_ptr=pipeline_dPsum.producer_get_barrier(
+                                    producer_state_dO_dPsum
+                                ),
                             )
                         producer_state_dO_dPsum.advance()
 
             else:
-                producer_state_Q_LSE, producer_state_dO_dPsum = produce_block_sparse_loads_bwd_sm100(
-                    blocksparse_tensors,
-                    n_block,
-                    load_Q,
-                    load_K,
-                    load_V,
-                    load_dO,
-                    copy_stats,
-                    gLSE,
-                    sLSE,
-                    gdPsum,
-                    sdPsum,
-                    pipeline_Q,
-                    pipeline_LSE,
-                    pipeline_dO,
-                    pipeline_dPsum,
-                    producer_state_Q_LSE,
-                    producer_state_dO_dPsum,
-                    tma_copy_bytes={"K": self.tma_copy_bytes["K"], "V": self.tma_copy_bytes["V"]},
+                producer_state_Q_LSE, producer_state_dO_dPsum = (
+                    produce_block_sparse_loads_bwd_sm100(
+                        blocksparse_tensors,
+                        n_block,
+                        load_Q,
+                        load_K,
+                        load_V,
+                        load_dO,
+                        copy_stats,
+                        gLSE,
+                        sLSE,
+                        gdPsum,
+                        sdPsum,
+                        pipeline_Q,
+                        pipeline_LSE,
+                        pipeline_dO,
+                        pipeline_dPsum,
+                        producer_state_Q_LSE,
+                        producer_state_dO_dPsum,
+                        tma_copy_bytes={
+                            "K": self.tma_copy_bytes["K"],
+                            "V": self.tma_copy_bytes["V"],
+                        },
+                    )
                 )
 
             if const_expr(should_load_Q):
@@ -1411,7 +1417,6 @@ class FlashAttentionBackwardSm100:
             tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
-                
 
     @cute.jit
     def mma(
@@ -1536,7 +1541,9 @@ class FlashAttentionBackwardSm100:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)  # must be seqlen_k
             if const_expr(self.use_block_sparsity):
-                block_iter_count = get_total_block_count(blocksparse_tensors, batch_idx, head_idx, n_block)
+                block_iter_count = get_total_block_count(
+                    blocksparse_tensors, batch_idx, head_idx, n_block
+                )
                 m_block_min, m_block_max = 0, block_iter_count
             else:
                 m_block_min, m_block_max = block_info.get_m_block_min_max(
@@ -1670,7 +1677,6 @@ class FlashAttentionBackwardSm100:
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
-
 
         # Currently it hangs if we have this S_P.producer_tail, will need to understand why
         # pipeline_S_P.producer_tail(producer_state_S_P)
@@ -1867,7 +1873,9 @@ class FlashAttentionBackwardSm100:
             )
 
             if const_expr(self.use_block_sparsity):
-                block_iter_count = get_total_block_count(blocksparse_tensors, batch_idx, head_idx, n_block)
+                block_iter_count = get_total_block_count(
+                    blocksparse_tensors, batch_idx, head_idx, n_block
+                )
                 m_block_min, m_block_max = 0, block_iter_count
 
             mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
@@ -1923,7 +1931,12 @@ class FlashAttentionBackwardSm100:
 
             # Mainloop
             if const_expr(self.use_block_sparsity):
-                (consumer_state_LSE, consumer_state_S_P_dP, consumer_state_dPsum, producer_state_dS) = compute_block_sparse_bwd_sm100(
+                (
+                    consumer_state_LSE,
+                    consumer_state_S_P_dP,
+                    consumer_state_dPsum,
+                    producer_state_dS,
+                ) = compute_block_sparse_bwd_sm100(
                     blocksparse_tensors,
                     n_block,
                     compute_step_fn,
@@ -1936,54 +1949,59 @@ class FlashAttentionBackwardSm100:
                 )
             else:
                 for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
-                    (consumer_state_LSE, consumer_state_S_P_dP, consumer_state_dPsum, producer_state_dS) = compute_step_fn(
+                    (
+                        consumer_state_LSE,
+                        consumer_state_S_P_dP,
+                        consumer_state_dPsum,
+                        producer_state_dS,
+                    ) = compute_step_fn(
                         m_block,
                         mask_fn=mask_fn,
                         consumer_state_LSE=consumer_state_LSE,
                         consumer_state_S_P_dP=consumer_state_S_P_dP,
                         consumer_state_dPsum=consumer_state_dPsum,
-                        producer_state_dS=producer_state_dS
+                        producer_state_dS=producer_state_dS,
                     )
             if const_expr(self.use_block_sparsity) and m_block_min >= m_block_max:
                 thr_copy_r2s_dKV = tiled_copy_r2s_dKV.get_slice(dp_idx)
                 if const_expr(not self.use_tma_store):
-                        assert False, "Not implemented for epi clear for no tma store"
+                    assert False, "Not implemented for epi clear for no tma store"
                 else:
                     consumer_state_dKV = self.epilogue_dKV_clear(
-                            dp_idx,
-                            batch_idx,
-                            head_idx,
-                            n_block,
-                            thr_mma_dV,
-                            tdVtdV,
-                            mdV_tma_tensor,
-                            sdV,
-                            tma_atom_dV,
-                            thr_copy_r2s_dKV,
-                            pipeline_dKV,
-                            consumer_state_dKV,
-                            None,  # Don't scale
-                            int(NamedBarrierBwdSm100.EpilogueWG1),  # barrier_id
-                            mdV_semaphore,
-                        )
+                        dp_idx,
+                        batch_idx,
+                        head_idx,
+                        n_block,
+                        thr_mma_dV,
+                        tdVtdV,
+                        mdV_tma_tensor,
+                        sdV,
+                        tma_atom_dV,
+                        thr_copy_r2s_dKV,
+                        pipeline_dKV,
+                        consumer_state_dKV,
+                        None,  # Don't scale
+                        int(NamedBarrierBwdSm100.EpilogueWG1),  # barrier_id
+                        mdV_semaphore,
+                    )
                     # #### STORE dK
                     consumer_state_dKV = self.epilogue_dKV_clear(
-                            dp_idx,
-                            batch_idx,
-                            head_idx,
-                            n_block,
-                            thr_mma_dK,
-                            tdKtdK,
-                            mdK_tma_tensor,
-                            sdK,
-                            tma_atom_dK,
-                            thr_copy_r2s_dKV,
-                            pipeline_dKV,
-                            consumer_state_dKV,
-                            softmax_scale if const_expr(self.qhead_per_kvhead == 1) else None,
-                            int(NamedBarrierBwdSm100.EpilogueWG1),  # barrier_id
-                            mdK_semaphore,
-                        )
+                        dp_idx,
+                        batch_idx,
+                        head_idx,
+                        n_block,
+                        thr_mma_dK,
+                        tdKtdK,
+                        mdK_tma_tensor,
+                        sdK,
+                        tma_atom_dK,
+                        thr_copy_r2s_dKV,
+                        pipeline_dKV,
+                        consumer_state_dKV,
+                        softmax_scale if const_expr(self.qhead_per_kvhead == 1) else None,
+                        int(NamedBarrierBwdSm100.EpilogueWG1),  # barrier_id
+                        mdK_semaphore,
+                    )
             else:
                 if const_expr(not self.use_tma_store):
                     consumer_state_dKV = self.epilogue_dKV(
@@ -2118,8 +2136,10 @@ class FlashAttentionBackwardSm100:
             assert num_epi_stages == self.num_epi_stages, "Epi stage calculation is wrong"
         else:
             num_epi_stages = self.num_epi_stages_gqa
-        
-        max_power_of_2 = (self.half_dim // num_epi_stages) & -(self.half_dim // num_epi_stages)  # find max num of instructions for LDTM
+
+        max_power_of_2 = (self.half_dim // num_epi_stages) & -(
+            self.half_dim // num_epi_stages
+        )  # find max num of instructions for LDTM
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(max_power_of_2)), Float32
         )
@@ -2135,7 +2155,7 @@ class FlashAttentionBackwardSm100:
             )
             cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
 
-        for epi_stage in cutlass.range_constexpr(num_epi_stages):            
+        for epi_stage in cutlass.range_constexpr(num_epi_stages):
             tdKVrdKV_r2s = cute.make_fragment(tdKVsdKV_r2s.shape, self.dv_dtype)
             tdKVrdKV_r2s.fill(0)
             cute.copy(thr_copy_r2s_dKV, tdKVrdKV_r2s, tdKVsdKV_r2s)
@@ -2480,7 +2500,9 @@ class FlashAttentionBackwardSm100:
                                 if iter_idx < curr_mask_cnt:
                                     lock_value = dQ_lock_values_mask[curr_mask_offset + iter_idx]
                                 else:
-                                    lock_value = dQ_lock_values_full[curr_full_offset + iter_idx - curr_mask_cnt]
+                                    lock_value = dQ_lock_values_full[
+                                        curr_full_offset + iter_idx - curr_mask_cnt
+                                    ]
                             else:
                                 lock_value = dQ_lock_values_mask[curr_mask_offset + iter_idx]
                         else:
@@ -2562,7 +2584,9 @@ class FlashAttentionBackwardSm100:
                         )
                 else:
                     # For dense: use original logic
-                    barrier.arrive_inc(mdQ_semaphore_cur[(m_block_max - 1, None)].iterator, tidx, 0, 1)
+                    barrier.arrive_inc(
+                        mdQ_semaphore_cur[(m_block_max - 1, None)].iterator, tidx, 0, 1
+                    )
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
@@ -2778,8 +2802,9 @@ class FlashAttentionBackwardSm100:
         else:
             num_epi_stages = self.num_epi_stages_gqa
 
-
-        max_power_of_2 = (self.half_dim // num_epi_stages) & -(self.half_dim // num_epi_stages)  # find max num of instructions for LDTM
+        max_power_of_2 = (self.half_dim // num_epi_stages) & -(
+            self.half_dim // num_epi_stages
+        )  # find max num of instructions for LDTM
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(max_power_of_2)), Float32
         )

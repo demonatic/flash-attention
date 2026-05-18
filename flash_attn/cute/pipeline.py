@@ -254,14 +254,18 @@ class PipelineTmaAsync(PipelineTmaAsyncOg):
         if self.consumer_mask is None:  # No cluster, 1 thread per warp group to signal
             if_generate(
                 cute.arch.thread_idx()[0] % 128 == 0,
-                lambda: self.sync_object_empty.arrive(state.index, self.consumer_mask, loc=loc, ip=ip),
+                lambda: self.sync_object_empty.arrive(
+                    state.index, self.consumer_mask, loc=loc, ip=ip
+                ),
                 loc=loc,
                 ip=ip,
             )
         else:
             if_generate(
                 self.is_signalling_thread,
-                lambda: self.sync_object_empty.arrive(state.index, self.consumer_mask, loc=loc, ip=ip),
+                lambda: self.sync_object_empty.arrive(
+                    state.index, self.consumer_mask, loc=loc, ip=ip
+                ),
                 loc=loc,
                 ip=ip,
             )
@@ -369,7 +373,9 @@ class PipelineTmaUmma(PipelineTmaUmmaOg):
         if const_expr(extra_tx_count == 0):
             if_generate(
                 self.is_leader_cta,
-                lambda: self.sync_object_full.arrive(state.index, self.producer_mask, loc=loc, ip=ip),
+                lambda: self.sync_object_full.arrive(
+                    state.index, self.producer_mask, loc=loc, ip=ip
+                ),
                 loc=loc,
                 ip=ip,
             )
@@ -377,7 +383,9 @@ class PipelineTmaUmma(PipelineTmaUmmaOg):
             tx_count = self.sync_object_full.tx_count + extra_tx_count
             if_generate(
                 self.is_leader_cta,
-                lambda: self.sync_object_full.arrive_and_expect_tx(state.index, tx_count, loc=loc, ip=ip),
+                lambda: self.sync_object_full.arrive_and_expect_tx(
+                    state.index, tx_count, loc=loc, ip=ip
+                ),
                 loc=loc,
                 ip=ip,
             )
