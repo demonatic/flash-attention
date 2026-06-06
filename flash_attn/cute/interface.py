@@ -33,7 +33,11 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from flash_attn.cute import utils
-from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80, FlashAttentionForwardSm90
+from flash_attn.cute.flash_fwd import (
+    FlashAttentionForwardSm80,
+    FlashAttentionForwardSm90,
+    FlashAttentionForwardSm120,
+)
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
@@ -267,7 +271,9 @@ def _flash_attn_fwd(
         else _compute_capability
     )
 
-    assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
+    assert compute_capability in [9, 10, 12], (
+        "Unsupported compute capability. Supported: 9.x, 10.x, 12.x"
+    )
 
 
     sparse_tensors = None
@@ -328,6 +334,20 @@ def _flash_attn_fwd(
         # TODO: fix GQA + SplitKV + non-varlen
         if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
             pack_gqa = False
+    if compute_capability == 12:
+        # SM120-family devices use CpAsync and warp-level MMA instead of the
+        # SM100 tcgen05 path. The initial forward configuration intentionally
+        # matches the kernel validated by NVIDIA/cutlass#3030.
+        if head_dim not in [64, 128] or head_dim_v not in [64, 128]:
+            raise NotImplementedError(
+                "SM 12.x forward currently supports head dimensions 64 and 128"
+            )
+        if num_splits != 1:
+            raise NotImplementedError("SplitKV is not supported on SM 12.x")
+        m_block_size = 128
+        n_block_size = 128
+        num_threads = 128
+        pack_gqa = False
 
     if num_splits < 1:
         max_seqlen_k = seqlen_k if cu_seqlens_k is None else (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
@@ -437,6 +457,40 @@ def _flash_attn_fwd(
         compute_capability,
         page_size not in [None, 128],  # paged KV non-TMA
     )
+    if compute_capability == 12:
+        kernel_args = (
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            o_tensor,
+            lse_tensor,
+            current_stream,
+            softmax_scale,
+            window_size_left,
+            window_size_right,
+            learnable_sink_tensor,
+            cute_aux_tensors,
+        )
+    else:
+        kernel_args = (
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            o_tensor,
+            lse_tensor,
+            softmax_scale,
+            current_stream,
+            cu_seqlens_q_tensor,
+            cu_seqlens_k_tensor,
+            seqused_q_tensor,
+            seqused_k_tensor,
+            page_table_tensor,
+            window_size_left,
+            window_size_right,
+            learnable_sink_tensor,
+            sparse_tensors,
+            cute_aux_tensors,
+        )
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
@@ -489,50 +543,55 @@ def _flash_attn_fwd(
                 is_varlen_q=cu_seqlens_q is not None
                     or seqused_q is not None,
             )
+        elif compute_capability == 12:
+            assert cu_seqlens_q is None and cu_seqlens_k is None, (
+                "varlen is not supported on SM 12.x"
+            )
+            assert seqused_q is None and seqused_k is None, (
+                "seqused is not supported on SM 12.x"
+            )
+            assert page_table is None, "paged KV is not supported on SM 12.x"
+            assert not is_split_kv, "SplitKV is not supported on SM 12.x"
+            assert not use_block_sparsity or arbitrary or mask_mod is not None, (
+                "block-sparse-only attention is not supported on SM 12.x"
+            )
+            assert learnable_sink is None, "learnable sink is not supported on SM 12.x"
+            assert FlashAttentionForwardSm120.can_implement(
+                dtype,
+                head_dim,
+                head_dim_v,
+                m_block_size,
+                n_block_size,
+                1,
+                num_threads,
+                causal,
+            ), "Unsupported SM 12.x forward configuration"
+            fa_fwd = FlashAttentionForwardSm120(
+                dtype,
+                head_dim,
+                head_dim_v,
+                qhead_per_kvhead,
+                is_causal=causal,
+                is_local=local,
+                is_arbitrary=arbitrary,
+                func_num=func_num,
+                pack_gqa=pack_gqa,
+                tile_m=m_block_size,
+                tile_n=n_block_size,
+                num_stages=1,
+                num_threads=num_threads,
+                Q_in_regs=False,
+                mask_mod=mask_mod,
+                score_mod=score_mod,
+                has_aux_tensors=aux_tensors is not None,
+            )
         else:
             raise ValueError(
-                f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x"
+                f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x, 12.x"
             )
         # TODO: check @can_implement
-        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
-            fa_fwd,
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            o_tensor,
-            lse_tensor,
-            softmax_scale,
-            current_stream,
-            cu_seqlens_q_tensor,
-            cu_seqlens_k_tensor,
-            seqused_q_tensor,
-            seqused_k_tensor,
-            page_table_tensor,
-            window_size_left,
-            window_size_right,
-            learnable_sink_tensor,
-            sparse_tensors,
-            cute_aux_tensors,
-        )
-    _flash_attn_fwd.compile_cache[compile_key](
-        q_tensor,
-        k_tensor,
-        v_tensor,
-        o_tensor,
-        lse_tensor,
-        softmax_scale,
-        current_stream,
-        cu_seqlens_q_tensor,
-        cu_seqlens_k_tensor,
-        seqused_q_tensor,
-        seqused_k_tensor,
-        page_table_tensor,
-        window_size_left,
-        window_size_right,
-        learnable_sink_tensor,
-        sparse_tensors,
-        cute_aux_tensors,
-    )
+        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(fa_fwd, *kernel_args)
+    _flash_attn_fwd.compile_cache[compile_key](*kernel_args)
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,

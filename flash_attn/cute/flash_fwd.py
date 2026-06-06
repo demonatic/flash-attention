@@ -672,7 +672,11 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             cute.make_tensor(t.iterator, cute.select(t.layout, mode=[1, 3, 2, 0]))
             for t in (mQ, mK, mV, mO)
         ]
-        mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=[2, 1, 0]))
+        mLSE = (
+            cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=[2, 1, 0]))
+            if const_expr(mLSE is not None)
+            else None
+        )
         # grid_dim: (m_block, num_head, batch_size)
         grid_dim = (
             cute.ceil_div(mQ.shape[0], self.tile_m),
@@ -1148,6 +1152,52 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         )
         # if const_expr(self.num_stages > 1):
         #     load_K_next()
+
+
+class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
+    """SM120/SM121 forward path using CpAsync and warp-level MMA.
+
+    Blackwell GeForce and GB10 do not support the tcgen05 instructions used by
+    the SM100 kernel. They do support the SM80-style ``mma.sync`` and CpAsync
+    operations used by this implementation. Keep ``arch`` at 80 so the shared
+    base selects that instruction path while CuTe compiles for the active
+    SM120-family device.
+    """
+
+    arch = 80
+
+    @staticmethod
+    def can_implement(
+        dtype,
+        head_dim,
+        head_dim_v,
+        tile_m,
+        tile_n,
+        num_stages,
+        num_threads,
+        is_causal,
+        Q_in_regs=False,
+    ) -> bool:
+        return (
+            head_dim in [64, 128]
+            and head_dim_v in [64, 128]
+            and tile_m == 128
+            and tile_n == 128
+            and num_stages == 1
+            and num_threads == 128
+            and not Q_in_regs
+            and FlashAttentionForwardSm80.can_implement(
+                dtype,
+                head_dim,
+                head_dim_v,
+                tile_m,
+                tile_n,
+                num_stages,
+                num_threads,
+                is_causal,
+                Q_in_regs,
+            )
+        )
 
 
 class FlashAttentionForwardSm90(FlashAttentionForwardBase):
