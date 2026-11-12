@@ -29,8 +29,8 @@ class Softmax(ParamsBase):
         arch: cutlass.Constexpr[int] = 80,
         softmax_scale: Float32 | None = None,
     ):
-        row_max = cute.make_fragment(num_rows, Float32)
-        row_sum = cute.make_fragment(num_rows, Float32)
+        row_max = cute.make_rmem_tensor(num_rows, Float32)
+        row_sum = cute.make_rmem_tensor(num_rows, Float32)
         return Softmax(scale_log2, num_rows, row_max, row_sum, arch, softmax_scale)
 
     def reset(self) -> None:
@@ -168,8 +168,8 @@ class SoftmaxSm100(Softmax):
     ):
         num_rows = 1
         arch = 100
-        row_max = cute.make_fragment(num_rows, Float32)
-        row_sum = cute.make_fragment(num_rows, Float32)
+        row_max = cute.make_rmem_tensor(num_rows, Float32)
+        row_sum = cute.make_rmem_tensor(num_rows, Float32)
         return SoftmaxSm100(
             scale_log2,
             num_rows,
@@ -364,19 +364,19 @@ def apply_score_mod_inner(
                                   when greater than 1 so score mods see logical heads.
     """
     n_vals = cutlass.const_expr(cute.size(score_tensor.shape))
-    score_vec = cute.make_fragment(vec_size, qk_acc_dtype)
-    kv_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+    score_vec = cute.make_rmem_tensor(vec_size, qk_acc_dtype)
+    kv_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
 
     # SSA values for batch (constant across all elements)
     batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32).broadcast_to((vec_size,))
 
     # Handle q_idx based on whether it's constant
-    q_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+    q_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
 
     # For Pack-GQA with non-constant q_idx, we need per-element head indices
     # since a thread my process multiple query head indices
     if cutlass.const_expr(qhead_per_kvhead > 1 and constant_q_idx is None):
-        head_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+        head_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
 
     for i in cutlass.range(0, n_vals, vec_size, unroll_full=True):
         for j in cutlass.range(vec_size, unroll_full=True):

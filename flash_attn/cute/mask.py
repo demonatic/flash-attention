@@ -277,11 +277,11 @@ class AttentionMask:
 
                 arbitrary_func = aux_tensors[0]
                 col_min = (
-                    cute.make_fragment((func_num // 2,), Int32)
+                    cute.make_rmem_tensor((func_num // 2,), Int32)
                     if const_expr(func_num // 2 > 0)
                     else None
                 )
-                col_max = cute.make_fragment((func_num // 2 + 1,), Int32)
+                col_max = cute.make_rmem_tensor((func_num // 2 + 1,), Int32)
                 col_max[0] = arbitrary_func[batch_idx, 0, 0, row_for_mod]
                 for i in cutlass.range_constexpr(func_num // 2):
                     col_min[i] = arbitrary_func[batch_idx, 0, 2 * i + 1, row_for_mod]
@@ -548,7 +548,7 @@ class AttentionMask:
                 # col_limits format: [col_max[0], col_min[0], col_max[1], col_min[1], ...]
                 # interval: [0, col_max[0]) ∪ [col_min[0], col_max[1]) ∪ ...
                 num_limits = const_expr(func_num + 1)  # func_num // 2 * 2 + 1
-                col_limits = cute.make_fragment((num_limits,), Int32)
+                col_limits = cute.make_rmem_tensor((num_limits,), Int32)
                 # load and convert to local coordinates relative to current n_block
                 col_limits[0] = max(
                     arbitrary_func[batch_idx, 0, 0, mask_row_for_mod] - n_block_offset, 0
@@ -566,11 +566,11 @@ class AttentionMask:
             else:
                 # fallback to naive method
                 col_min = (
-                    cute.make_fragment((func_num // 2,), Int32)
+                    cute.make_rmem_tensor((func_num // 2,), Int32)
                     if const_expr(func_num // 2 > 0)
                     else None
                 )
-                col_max = cute.make_fragment((func_num // 2 + 1,), Int32)
+                col_max = cute.make_rmem_tensor((func_num // 2 + 1,), Int32)
                 col_max[0] = arbitrary_func[batch_idx, 0, 0, mask_row_for_mod]
                 for i in cutlass.range_constexpr(func_num // 2):
                     col_min[i] = arbitrary_func[batch_idx, 0, 2 * i + 1, mask_row_for_mod]
